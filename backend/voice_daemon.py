@@ -4,10 +4,12 @@ import time
 import queue
 import wave
 import threading
+import tempfile
 
 import numpy as np
 import sounddevice as sd
 from dotenv import load_dotenv
+
 import pyttsx3
 
 # ---- env ----
@@ -20,7 +22,8 @@ BLOCK_SIZE = 1024
 SILENCE_THRESHOLD = 0.01
 MAX_RECORD_SECONDS = 15
 
-VOSK_MODEL_PATH = os.getenv("VOSK_MODEL_PATH")
+WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL", "base")
+WHISPER_DEVICE_ENV = os.getenv("WHISPER_DEVICE", "").strip().lower()
 
 audio_q = queue.Queue()
 tts_q = queue.Queue()
@@ -41,53 +44,64 @@ def _rms(x):
     return float(np.sqrt(np.mean(np.square(x.astype(np.float32)))))
 
 
-# ---- STT (Vosk offline) ----
-_vosk_ready = False
-_vosk_rec = None
+# ---- STT (OpenAI Whisper local) ----
+_whisper_ready = False
+_whisper_model = None
+_whisper_device = "cpu"
 
 
-def _vosk_init():
-    global _vosk_ready, _vosk_rec
-    if _vosk_ready:
+def _whisper_init():
+    global _whisper_ready, _whisper_model, _whisper_device
+    if _whisper_ready:
         return
-    if not VOSK_MODEL_PATH or not os.path.isdir(VOSK_MODEL_PATH):
-        raise RuntimeError(
-            "VOSK_MODEL_PATH is not set or not a directory. Download a Vosk model and set the env var."
-        )
-    from vosk import Model, KaldiRecognizer
+    import torch
+    import whisper
 
-    model = Model(VOSK_MODEL_PATH)
-    rec = KaldiRecognizer(model, SAMPLE_RATE)
-    _vosk_rec = rec
-    _vosk_ready = True
+    if WHISPER_DEVICE_ENV in ("cpu", "cuda"):
+        _whisper_device = WHISPER_DEVICE_ENV
+    else:
+        _whisper_device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    _whisper_model = whisper.load_model(WHISPER_MODEL_NAME, device=_whisper_device)
+    _whisper_ready = True
 
 
 def transcribe(audio_bytes: bytes) -> str:
-    _vosk_init()
-    import json as pyjson
+    _whisper_init()
+    import whisper
 
-    with wave.open(io.BytesIO(audio_bytes), "rb") as wf:
-        if wf.getframerate() != SAMPLE_RATE:
-            raise RuntimeError(
-                f"Expected {SAMPLE_RATE} Hz audio for Vosk; got {wf.getframerate()}"
-            )
-        _vosk_rec.Reset()
-        while True:
-            data = wf.readframes(4000)
-            if len(data) == 0:
-                break
-            _vosk_rec.AcceptWaveform(data)
-        res = pyjson.loads(_vosk_rec.FinalResult())
-        return (res.get("text") or "").strip()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+        tmp.write(audio_bytes)
+        tmp_path = tmp.name
+
+    try:
+        # Whisper will resample internally; file path is simplest/most robust
+        result = _whisper_model.transcribe(
+            tmp_path,
+            fp16=False if _whisper_device == "cpu" else True,
+            language=None,  # autodetect
+            condition_on_previous_text=False,
+            initial_prompt=None,
+            temperature=0.0,
+        )
+        text = (result.get("text") or "").strip()
+        return text
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
 
 
 # ---- TTS worker ----
 def _speak_once(text: str):
+    if not text:
+        return
     if HAS_SAPI:
         voice = wincl.Dispatch("SAPI.SpVoice")
         voice.Speak(text)
     else:
-        eng = pyttsx3.init()  # fresh engine per utterance avoids lockups
+        eng = pyttsx3.init()
         try:
             eng.say(text)
             eng.runAndWait()
