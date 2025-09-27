@@ -195,4 +195,4 @@ def api_history():
     return jsonify([norm(x) for x in hist_copy]), 200
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5003, debug=False, threaded=True)
+    app.run(host="127.0.0.1", port=5003, debug=False, threaded=True)    
