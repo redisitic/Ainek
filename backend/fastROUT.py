@@ -55,7 +55,7 @@ APP_MAP = {
     "command prompt": "cmd",
     "terminal": "wt",
     "instagram": "https://www.instagram.com/",
-    "store": "ms-windows-store://home"  # optional Windows store protocol
+    "reels": "https://www.instagram.com/reels/",
 }
 
 HTML = """
@@ -76,6 +76,10 @@ DRY_RUN = os.environ.get("DRY_RUN", "0") == "1"
 FASTR_BASE = os.environ.get("FASTR_BASE", "https://go.fastrouter.ai/api/v1")
 FASTR_API_KEY = os.environ.get("FASTR_API_KEY")  # REQUIRED to enable LLM
 LLM_MODEL = os.environ.get("LLM_MODEL", "anthropic/claude-sonnet-4-20250514")
+
+REELS_SCROLL_INTERVAL = int(os.environ.get("REELS_SCROLL_INTERVAL", "8"))
+REELS_SCROLL_STEPS = int(os.environ.get("REELS_SCROLL_STEPS", "45"))
+REELS_CANCEL = threading.Event()
 
 if not FASTR_API_KEY:
     app.logger.warning("FASTR_API_KEY is not set. LLM calls are disabled until FASTR_API_KEY is provided.")
@@ -167,19 +171,23 @@ def _build_messages_for_llm(prompt: str, history_entries: list):
     """Build messages (system + recent history + user)."""
     system_msg = {
         "role": "system",
-        "content": (
+       "content": (
             "You are RudeBot: curt, sarcastic and blunt. "
-            "Your job is to EITHER (A) decide the user intent is to open an application, "
-            "or (B) produce a short rude chat reply. "
-            "You MUST reply ONLY in JSON with these keys: "
-            "\"intent\" (one of \"open_app\" or \"chat\"), "
-            "\"app\" (string, name of app or search query — required if intent is \"open_app\"; otherwise null), "
-            "\"reply\" (string: the chat text the assistant would say to the user). "
-            "Examples (JSON only, no extra text):\n"
-            '{"intent":"open_app","app":"instagram","reply":"Sure, opening Instagram. Don\\\'t drool on it."}\n'
-            '{"intent":"chat","app":null,"reply":"You\\\'re dull. Ask something real."}\n'
-            "If you detect that the user is asking to open something, set intent to \"open_app\" and set \"app\" to the best short app name or search query. "
-            "Otherwise set intent to \"chat\" and set \"app\" to null. Reply should be short and rude."
+            "Decide user intent as exactly one of: \"open_app\", \"scroll_reels\", \"stop_reels\", or \"chat\". "
+            "Return ONLY JSON with keys: "
+            "\"intent\" (one of \"open_app\",\"scroll_reels\",\"stop_reels\",\"chat\"), "
+            "\"app\" (string for app/search when intent is \"open_app\"; otherwise null), "
+            "\"reply\" (short rude string).\n"
+            "Rules:\n"
+            "- If the user asks to open/launch something, use intent \"open_app\" and set \"app\" accordingly.\n"
+            "- If the user asks to watch/scroll reels (e.g., \"scroll reels\", \"keep swiping reels\", \"auto-play reels\"), use intent \"scroll_reels\".\n"
+            "- If the user asks to stop/cancel/quit reels scrolling (e.g., \"stop reels\", \"cancel scrolling\", \"enough reels\"), use intent \"stop_reels\".\n"
+            "- Otherwise use intent \"chat\".\n"
+            "Examples (JSON only):\n"
+            "{\"intent\":\"open_app\",\"app\":\"instagram\",\"reply\":\"Opening Instagram. Don’t get lost.\"}\n"
+            "{\"intent\":\"scroll_reels\",\"app\":null,\"reply\":\"Fine. Reels on auto-pilot.\"}\n"
+            "{\"intent\":\"stop_reels\",\"app\":null,\"reply\":\"Stopping the dopamine drip.\"}\n"
+            "{\"intent\":\"chat\",\"app\":null,\"reply\":\"That was pointless. Try again.\"}\n"
         )
     }
 
@@ -241,6 +249,52 @@ def _require_api_key(req):
         return False, "Invalid API key"
     return True, ""
 
+def _open_instagram_reels_and_autoscroll(interval: int = REELS_SCROLL_INTERVAL, steps: int = REELS_SCROLL_STEPS):
+    """
+    Open Instagram Reels and auto-scroll every `interval` seconds for `steps` steps.
+    Honors REELS_CANCEL for mid-run stop.
+    """
+    try:
+        if DRY_RUN:
+            return True, f"(DRY_RUN) Would open Instagram Reels and auto-scroll every {interval}s for {steps} steps."
+
+        # Fresh run -> clear any previous cancel
+        REELS_CANCEL.clear()
+
+        webbrowser.open("https://www.instagram.com/reels/")
+        time.sleep(4.0)
+
+        # Force-load reels in case default browser ignores first open
+        pyautogui.hotkey("ctrl", "l"); time.sleep(0.1)
+        pyautogui.typewrite("https://www.instagram.com/reels/")
+        pyautogui.press("enter"); time.sleep(3.0)
+
+        # Best-effort: move pointer onto page so scroll events land
+        try:
+            w, h = pyautogui.size()
+            pyautogui.moveTo(w // 2, int(h * 0.6), duration=0.1)
+        except Exception:
+            pass
+
+        # Scroll loop with responsive sleep
+        for i in range(int(steps)):
+            if REELS_CANCEL.is_set():
+                return True, f"Stopped after {i} steps."
+
+            pyautogui.scroll(-1500)
+            pyautogui.press("pagedown")
+
+            # Sleep in 100ms ticks so cancel is responsive
+            ticks = max(1, int(float(interval) / 0.1))
+            for _ in range(ticks):
+                if REELS_CANCEL.is_set():
+                    return True, f"Stopped after {i} steps."
+                time.sleep(0.1)
+
+        return True, f"Reels auto-scrolled {steps} steps (every {interval}s)."
+    except Exception as e:
+        app.logger.exception("Error during Reels autoscroll")
+        return False, f"Autoscroll error: {e}"
 
 # ---- Routes ----
 @app.route("/", methods=["GET"])
@@ -271,6 +325,31 @@ def open_route():
     intent = resp.get("intent")
     app_name = resp.get("app")
     reply_text = resp.get("reply") or ""
+
+    if intent == "scroll_reels":
+            def bg_scroll():
+                success_bg, msg_bg = _open_instagram_reels_and_autoscroll()
+                bot_entry_bg = {
+                    "id": f"b-{int(time.time()*1000)}",
+                    "sender": "bot",
+                    "text": f"{reply_text} ({msg_bg})",
+                    "time": time.time(),
+                }
+                _add_history_entry(bot_entry_bg)
+
+            threading.Thread(target=bg_scroll, daemon=True).start()
+            start_msg = f"{reply_text} (Starting Instagram Reels autoscroll every {REELS_SCROLL_INTERVAL}s for {REELS_SCROLL_STEPS} steps)"
+            bot_entry = {"id": f"b-{int(time.time()*1000)}", "sender": "bot", "text": start_msg, "time": time.time()}
+            _add_history_entry(bot_entry)
+            return render_template_string(HTML, result=start_msg)
+    
+    if intent == "stop_reels":
+        REELS_CANCEL.set()
+        msg = reply_text or "Stopping reels autoscroll."
+        bot_entry = {"id": f"b-{int(time.time()*1000)}", "sender": "bot", "text": msg, "time": time.time()}
+        _add_history_entry(bot_entry)
+        return render_template_string(HTML, result=msg)
+
 
     if intent == "open_app" and app_name:
         success, msg = _open_app_by_name_from_llm(app_name)
@@ -316,6 +395,31 @@ def open_api():
     intent = resp.get("intent")
     app_name = resp.get("app")
     reply_text = resp.get("reply") or ""
+
+    if intent == "scroll_reels":
+        def bg_scroll():
+            success_bg, msg_bg = _open_instagram_reels_and_autoscroll()
+            bot_entry_bg = {
+                "id": f"b-{int(time.time()*1000)}",
+                "sender": "bot",
+                "text": f"{reply_text} ({msg_bg})",
+                "time": time.time(),
+            }
+            _add_history_entry(bot_entry_bg)
+
+        threading.Thread(target=bg_scroll, daemon=True).start()
+        return jsonify({
+            "ok": True,
+            "message": f"{reply_text} (Opening Instagram Reels and auto-scrolling every {REELS_SCROLL_INTERVAL}s for {REELS_SCROLL_STEPS} steps)"
+        }), 202
+
+
+    if intent == "stop_reels":
+        REELS_CANCEL.set()
+        bot_entry = {"id": f"b-{int(time.time()*1000)}", "sender": "bot", "text": reply_text or "Stopping reels.", "time": time.time()}
+        _add_history_entry(bot_entry)
+        return jsonify({"ok": True, "message": reply_text or "Stopping reels."}), 200
+
 
     if intent == "open_app" and app_name:
         # support sync param: ?sync=1 to open synchronously (for API clients)
