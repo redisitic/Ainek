@@ -1,15 +1,15 @@
 # ye sabh karna hei aaj
 
-# 🦾 Alnek: AI-Powered Voice Assistant for Visually Impaired Users  
+# Alnek: AI-Powered Voice Assistant for Visually Impaired Users  
 
 ---
 
-## 📌 Problem Statement  
+## Problem Statement  
 Visually impaired users struggle with modern GUIs where screen readers fail to interpret icons, menus, and visual cues. This creates dependency on external help for tasks like browsing, emailing, or navigating files.  
 
 ---
 
-## 🎯 Goal  
+##  Goal  
 Build a lightweight **Python-based assistant** that:  
 - Activates via **hotkey**  
 - Captures a **screenshot + voice command**  
@@ -18,9 +18,9 @@ Build a lightweight **Python-based assistant** that:
 
 ---
 
-## 🚀 Implementation Plan  
+## Implementation Plan  
 
-### ✅ Core MVP (Hackathon Focus)  
+### Core MVP (Hackathon Focus)  
 1. **Hotkey Activation** – listen globally for trigger (e.g., `Ctrl+Alt+S`)  
 2. **Screen Capture** – grab screenshot of current screen  
 3. **Voice Input** – record audio, send to Google Gemini API (STT)  
@@ -30,7 +30,7 @@ Build a lightweight **Python-based assistant** that:
    - Generate action steps  
 5. **Voice Output** – convert instructions to speech with TTS  
 
-### 🔄 Optional (if time allows)  
+### Optional (if time allows)  
 - Cursor location feedback (`x, y` coordinates)  
 - Basic error handling (`"Sorry, I didn’t understand"`)  
 - Support for one extra app (Word or email client)  
