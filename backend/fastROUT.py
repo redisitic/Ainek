@@ -167,17 +167,37 @@ def _open_app_by_name_from_llm(app_name_raw: str):
     return _search_and_open(app_name_raw)
 
 
-def _build_messages_for_llm(prompt: str, history_entries: list):
-    """Build messages (system + recent history + user)."""
+def _build_messages_for_llm(prompt: str, history_entries: list, tone: str = "rude"):
+    """Build messages (system + recent history + user) with a chosen tone/persona."""
+
+    tone = (tone or "rude").strip().lower()
+    allowed = {"rude", "friendly", "professional", "excited"}
+    if tone not in allowed:
+        tone = "rude"
+
+    persona_line = {
+        "rude": "You are RudeBot: curt, sarcastic and blunt.",
+        "friendly": "You are FriendlyBot: warm, helpful, and polite.",
+        "professional": "You are ProBot: concise, neutral, and businesslike.",
+        "excited": "You are HypeBot: energetic, enthusiastic, and upbeat.",
+    }[tone]
+
+    reply_style = {
+        "rude": "short rude string",
+        "friendly": "short friendly and positive string",
+        "professional": "short professional and neutral string",
+        "excited": "short excited and enthusiastic string",
+    }[tone]
+
     system_msg = {
         "role": "system",
-       "content": (
-            "You are RudeBot: curt, sarcastic and blunt. "
+        "content": (
+            f"{persona_line} "
             "Decide user intent as exactly one of: \"open_app\", \"scroll_reels\", \"stop_reels\", or \"chat\". "
             "Return ONLY JSON with keys: "
             "\"intent\" (one of \"open_app\",\"scroll_reels\",\"stop_reels\",\"chat\"), "
             "\"app\" (string for app/search when intent is \"open_app\"; otherwise null), "
-            "\"reply\" (short rude string).\n"
+            f"\"reply\" ({reply_style}).\n"
             "Rules:\n"
             "- If the user asks to open/launch something, use intent \"open_app\" and set \"app\" accordingly.\n"
             "- If the user asks to watch/scroll reels (e.g., \"scroll reels\", \"keep swiping reels\", \"auto-play reels\"), use intent \"scroll_reels\".\n"
@@ -201,7 +221,7 @@ def _build_messages_for_llm(prompt: str, history_entries: list):
     return msgs
 
 
-def _ask_llm_for_intent(prompt: str, history_entries: list):
+def _ask_llm_for_intent(prompt: str, history_entries: list, tone: str = "rude"):
     """
     Send prompt+history to the LLM that must return JSON as per system instruction.
     Returns (ok: bool, parsed_dict_or_error_str)
@@ -209,7 +229,7 @@ def _ask_llm_for_intent(prompt: str, history_entries: list):
     if not llm_client:
         return False, "LLM disabled: FASTR_API_KEY not set (FastRouter only)."
 
-    messages = _build_messages_for_llm(prompt, history_entries)
+    messages = _build_messages_for_llm(prompt, history_entries, tone)
     try:
         resp = llm_client.chat.completions.create(
             model=LLM_MODEL,
@@ -218,21 +238,50 @@ def _ask_llm_for_intent(prompt: str, history_entries: list):
             max_tokens=300,
         )
         text = resp.choices[0].message.content
-        # Try to parse JSON — be tolerant of whitespace
+
+        # Normalize possible code fences and stray prefixes
+        def _normalize(raw):
+            if raw is None:
+                return ""
+            s = str(raw).strip()
+            # Remove Markdown code fences if present
+            if s.startswith("```"):
+                # strip leading fence and optional language tag
+                s = s.split("\n", 1)[1] if "\n" in s else s
+                if s.endswith("```"):
+                    s = s[:-3]
+            return s.strip()
+
+        text_norm = _normalize(text)
+
+        # Try strict JSON first
         try:
-            parsed = json.loads(text)
-            return True, parsed
+            return True, json.loads(text_norm)
         except Exception:
-            # If not strict JSON, attempt to locate a JSON object substring
-            start = text.find("{")
-            end = text.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                try:
-                    parsed = json.loads(text[start:end+1])
-                    return True, parsed
-                except Exception:
-                    return False, f"LLM responded but JSON parse failed. Raw: {text}"
-            return False, f"LLM responded but did not return JSON. Raw: {text}"
+            pass
+
+        # Try brace substring
+        start = text_norm.find("{")
+        end = text_norm.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            candidate = text_norm[start:end + 1]
+            try:
+                return True, json.loads(candidate)
+            except Exception:
+                pass
+
+        # Try forgiving single-quote JSON
+        sq = text_norm.replace("'", '"')
+        start = sq.find("{")
+        end = sq.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            candidate = sq[start:end + 1]
+            try:
+                return True, json.loads(candidate)
+            except Exception:
+                pass
+
+        return False, f"LLM responded but JSON parse failed. Raw: {text}"
     except Exception as e:
         app.logger.exception("LLM call failed")
         return False, f"LLM error: {e}"
@@ -379,13 +428,16 @@ def open_api():
 
     data = request.get_json(force=True, silent=True) or {}
     prompt = (data.get("prompt") or "").strip()
+    tone = (data.get("tone") or "rude").strip().lower()
+    if tone not in {"rude", "friendly", "professional", "excited"}:
+        tone = "rude"
     if not prompt:
         return jsonify({"ok": False, "error": "no prompt provided"}), 400
 
     user_entry = {"id": f"u-{int(time.time()*1000)}", "sender": "user", "text": prompt, "time": time.time()}
     _add_history_entry(user_entry)
 
-    ok, resp = _ask_llm_for_intent(prompt, CHAT_HISTORY)
+    ok, resp = _ask_llm_for_intent(prompt, CHAT_HISTORY, tone)
     if not ok:
         # LLM error or parse error
         bot_entry = {"id": f"b-{int(time.time()*1000)}", "sender": "bot", "text": resp, "time": time.time()}
