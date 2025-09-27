@@ -1,0 +1,7 @@
+
+
+Flask==2.3.3
+flask-cors==4.0.0
+fuzzywuzzy==0.18.0
+python-Levenshtein==0.12.2  
+pyautogui==0.9.54
