@@ -1,7 +1,31 @@
+# Core numeric/audio
+numpy>=1.24
+sounddevice>=0.4.6
 
+# Env + HTTP
+python-dotenv>=1.0.1
+requests>=2.32.3
 
-Flask==2.3.3
-flask-cors==4.0.0
-fuzzywuzzy==0.18.0
-python-Levenshtein==0.12.2  
-pyautogui==0.9.54
+# Web server
+Flask>=3.0.3
+flask-cors>=4.0.1
+
+# LLM client (FastRouter-compatible OpenAI SDK)
+openai>=1.40.0
+
+# Speech-to-text (Whisper) + Torch
+openai-whisper>=20231117
+torch>=2.2.0
+
+# Text-to-speech
+pyttsx3>=2.90
+pywin32>=306 ; platform_system == "Windows"  # needed for SAPI on Windows
+
+# Desktop automation
+pyautogui>=0.9.54
+
+# Gmail / Google APIs
+google-api-python-client>=2.143.0
+google-auth>=2.34.0
+google-auth-oauthlib>=1.2.1
+google-auth-httplib2>=0.2.0
