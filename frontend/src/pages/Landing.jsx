@@ -1,10 +1,8 @@
+// Landing.jsx
 import React, { useEffect, useRef, useState } from "react";
 
-// Landing.jsx — Open apps via Flask `/api/open`
 // Usage:
-// <Landing apiBase="http://127.0.0.1:5003" apiKey={"your-key-if-any"} />
-// The component sends POST { prompt } to `${apiBase}/api/open` and displays the response.
-
+// <Landing apiBase="http://127.0.0.1:5003" apiKey={process.env.REACT_APP_FLASK_API_KEY} />
 export default function Landing({ apiBase = "http://127.0.0.1:5003", apiKey = null }) {
   const [prompt, setPrompt] = useState("");
   const [history, setHistory] = useState([]);
@@ -15,7 +13,6 @@ export default function Landing({ apiBase = "http://127.0.0.1:5003", apiKey = nu
   const base = apiBase?.replace(/\/$/, "");
 
   useEffect(() => {
-    // scroll to bottom on history change
     if (listRef.current) {
       listRef.current.scrollTop = listRef.current.scrollHeight;
     }
@@ -23,7 +20,7 @@ export default function Landing({ apiBase = "http://127.0.0.1:5003", apiKey = nu
 
   const append = (entry) => setHistory((h) => [...h, entry]);
 
-  async function openApp() {
+  async function sendPrompt() {
     if (!prompt.trim()) return;
     const text = prompt.trim();
     append({ id: `u-${Date.now()}`, sender: "user", text, time: new Date().toISOString() });
@@ -47,13 +44,12 @@ export default function Landing({ apiBase = "http://127.0.0.1:5003", apiKey = nu
         throw new Error(msg);
       }
 
-      // server responds with { ok: bool, message: str }
-      const reply = json?.message || (json?.ok ? "Opened (unknown)" : "Failed");
-      append({ id: `b-${Date.now()}`, sender: "bot", text: reply, time: new Date().toISOString() });
+      const reply = json?.message || (json?.ok ? "OK" : "Failed");
+      append({ id: `b-${Date.now()}`, sender: "rude-bot", text: reply, time: new Date().toISOString() });
     } catch (e) {
       console.error(e);
       setError(e.message || "Request failed");
-      append({ id: `b-err-${Date.now()}`, sender: "bot", text: `Error: ${e.message}` });
+      append({ id: `b-err-${Date.now()}`, sender: "rude-bot", text: `Error: ${e.message}` });
     } finally {
       setLoading(false);
     }
@@ -62,20 +58,28 @@ export default function Landing({ apiBase = "http://127.0.0.1:5003", apiKey = nu
   return (
     <div className="flex flex-col h-screen bg-gray-50">
       <header className="bg-white border-b p-3 flex items-center justify-between">
-        <h1 className="text-lg font-semibold">Open App — Frontend</h1>
+        <h1 className="text-lg font-semibold">Rude Assistant — Frontend</h1>
         <div className="text-sm text-gray-500">Backend: {base}</div>
       </header>
 
       <main className="flex-1 overflow-hidden">
         <div ref={listRef} className="h-full overflow-y-auto p-4 space-y-3">
           {history.length === 0 && (
-            <div className="text-gray-400">No activity yet — try: <code>open chrome</code> or <code>launch notepad</code></div>
+            <div className="text-gray-400">
+              No activity yet — try "hello", "what is python", or "open instagram"
+            </div>
           )}
 
           {history.map((m) => (
             <div key={m.id} className={`flex ${m.sender === "user" ? "justify-end" : "justify-start"}`}>
-              <div className={`max-w-xl px-4 py-2 rounded-2xl shadow ${m.sender === "user" ? "bg-blue-600 text-white rounded-br-none" : "bg-gray-200 text-gray-900 rounded-bl-none"}`}>
-                <div className="whitespace-pre-wrap">{m.text}</div>
+              <div
+                className={`max-w-xl px-4 py-2 rounded-2xl shadow ${
+                  m.sender === "user" ? "bg-blue-600 text-white rounded-br-none" : "bg-gray-900 text-white rounded-bl-none"
+                }`}
+              >
+                <div className="whitespace-pre-wrap">
+                  {m.sender === "rude-bot" ? <strong>RudeBot:</strong> : null} {m.text}
+                </div>
                 {m.time && <div className="text-xs text-gray-400 mt-1">{new Date(m.time).toLocaleString()}</div>}
               </div>
             </div>
@@ -83,7 +87,7 @@ export default function Landing({ apiBase = "http://127.0.0.1:5003", apiKey = nu
 
           {loading && (
             <div className="flex justify-start">
-              <div className="px-3 py-2 rounded-2xl bg-gray-200 text-gray-700 animate-pulse">Opening…</div>
+              <div className="px-3 py-2 rounded-2xl bg-gray-200 text-gray-700 animate-pulse">Thinking…</div>
             </div>
           )}
         </div>
@@ -94,17 +98,13 @@ export default function Landing({ apiBase = "http://127.0.0.1:5003", apiKey = nu
           <input
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && openApp()}
-            placeholder='Type e.g. "open chrome" or "launch notepad"'
+            onKeyDown={(e) => e.key === "Enter" && sendPrompt()}
+            placeholder='Chat or ask to open an app, e.g. "open chrome" or "hey, open store"'
             className="flex-1 rounded-lg border px-3 py-2 outline-none focus:ring focus:ring-blue-200"
           />
 
-          <button
-            onClick={openApp}
-            disabled={loading}
-            className="bg-blue-600 text-white px-4 py-2 rounded-lg disabled:opacity-60"
-          >
-            Open
+          <button onClick={sendPrompt} disabled={loading} className="bg-blue-600 text-white px-4 py-2 rounded-lg disabled:opacity-60">
+            Send
           </button>
         </div>
         {error && <div className="text-sm text-red-500 mt-2">{error}</div>}
