@@ -1,7 +1,5 @@
 import os
-import os
 import time
-import threading
 import threading
 import webbrowser
 import logging
@@ -34,29 +32,15 @@ load_dotenv()
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
-logging.basicConfig(level=logging.INFO)
 
 try:
     from flask_cors import CORS
     CORS(app, resources={r"/api/*": {"origins": "*"}})
 except Exception:
     app.logger.info("flask_cors not installed — continuing without it.")
-    app.logger.info("flask_cors not installed — continuing without it.")
 
 CHAT_HISTORY = []
 CHAT_LOCK = threading.Lock()
-
-CURRENT_DRAFT = {}
-
-_MONTHS = {
-    "january":1,"february":2,"march":3,"april":4,"may":5,"june":6,
-    "july":7,"august":8,"september":9,"october":10,"november":11,"december":12
-}
-
-GMAIL_SCOPES = [
-    "https://www.googleapis.com/auth/gmail.readonly",
-    "https://www.googleapis.com/auth/gmail.send",
-]
 
 CURRENT_DRAFT = {}
 
@@ -80,15 +64,6 @@ APP_MAP = {
     "notepad": "notepad",
     "calculator": "calc",
     "paint": "mspaint",
-    "chrome": "chrome",
-    "firefox": "firefox",
-    "edge": "msedge",
-    "word": "Microsoft Word",
-    "excel": "Microsoft Excel",
-    "powerpoint": "Microsoft PowerPoint",
-    "notepad": "notepad",
-    "calculator": "calc",
-    "paint": "mspaint",
     "settings": "ms-settings:",
     "youtube": "https://www.youtube.com/",
     "gmail": "https://mail.google.com/",
@@ -101,20 +76,13 @@ APP_MAP = {
     "terminal": "wt",
     "instagram": "https://www.instagram.com/",
     "reels": "https://www.instagram.com/reels/",
-    "terminal": "wt",
-    "instagram": "https://www.instagram.com/",
-    "reels": "https://www.instagram.com/reels/",
 }
 
 HTML = """
 <!doctype html>
 <title>Ainek</title>
 <h2>Ainek (web)</h2>
-<title>Ainek</title>
-<h2>Ainek (web)</h2>
 <form method="post" action="/open">
-  <input name="prompt" style="width:700px" autofocus required>
-  <button type="submit">Send</button>
   <input name="prompt" style="width:700px" autofocus required>
   <button type="submit">Send</button>
 </form>
@@ -183,12 +151,10 @@ def _open_mapped_target(key: str):
             return False, f"No map target for '{key}'"
         if DRY_RUN:
             return True, f"(DRY_RUN) Would open mapped: {key} -> {target}"
-            return True, f"(DRY_RUN) Would open mapped: {key} -> {target}"
         if isinstance(target, str) and (target.startswith("http") or target.endswith(":")):
             webbrowser.open(target)
         else:
             pyautogui.hotkey("win", "s")
-            time.sleep(0.7)
             time.sleep(0.7)
             pyautogui.typewrite(str(target))
             time.sleep(0.6)
@@ -746,359 +712,14 @@ def open_route():
     _add_history_entry({"id": f"b-{int(time.time()*1000)}", "sender": "bot", "text": reply_text, "time": time.time()})
     return render_template_string(HTML, result=reply_text)
 
-def _open_instagram_reels_and_autoscroll(interval: int = REELS_SCROLL_INTERVAL, steps: int = REELS_SCROLL_STEPS):
-    try:
-        if DRY_RUN:
-            return True, f"(DRY_RUN) Would open Instagram Reels and auto-scroll every {interval}s for {steps} steps."
-        REELS_CANCEL.clear()
-        webbrowser.open("https://www.instagram.com/reels/")
-        time.sleep(4.0)
-        pyautogui.hotkey("ctrl", "l"); time.sleep(0.1)
-        pyautogui.typewrite("https://www.instagram.com/reels/")
-        pyautogui.press("enter"); time.sleep(3.0)
-        try:
-            w, h = pyautogui.size()
-            pyautogui.moveTo(w // 2, int(h * 0.6), duration=0.1)
-        except Exception:
-            pass
-        for i in range(int(steps)):
-            if REELS_CANCEL.is_set():
-                return True, f"Stopped after {i} steps."
-            pyautogui.scroll(-1500)
-            pyautogui.press("pagedown")
-            ticks = max(1, int(float(interval) / 0.1))
-            for _ in range(ticks):
-                if REELS_CANCEL.is_set():
-                    return True, f"Stopped after {i} steps."
-                time.sleep(0.1)
-        return True, f"Reels auto-scrolled {steps} steps (every {interval}s)."
-    except Exception as e:
-        app.logger.exception("Error during Reels autoscroll")
-        return False, f"Autoscroll error: {e}"
-
-def _gmail_service():
-    creds = None
-    if os.path.exists(TOKEN_PATH):
-        creds = Credentials.from_authorized_user_file(TOKEN_PATH, GMAIL_SCOPES)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            if not os.path.exists(CRED_PATH):
-                raise RuntimeError(f"credentials.json not found at: {CRED_PATH}. Set GMAIL_CREDENTIALS_PATH or place the file there.")
-            flow = InstalledAppFlow.from_client_secrets_file(CRED_PATH, GMAIL_SCOPES)
-            creds = flow.run_local_server(port=0)
-        with open(TOKEN_PATH, "w") as token:
-            token.write(creds.to_json())
-    return build("gmail", "v1", credentials=creds, cache_discovery=False)
-
-def _gmail_recent(n=10):
-    svc = _gmail_service()
-    msgs = svc.users().messages().list(userId="me", labelIds=["INBOX"], maxResults=n).execute().get("messages", [])
-    out = []
-    for m in msgs:
-        full = svc.users().messages().get(userId="me", id=m["id"], format="metadata", metadataHeaders=["From","Subject","Date"]).execute()
-        hdrs = {h["name"].lower(): h["value"] for h in full.get("payload", {}).get("headers", [])}
-        out.append({
-            "id": m["id"],
-            "threadId": full.get("threadId"),
-            "from": hdrs.get("from",""),
-            "subject": hdrs.get("subject",""),
-            "date": hdrs.get("date",""),
-            "snippet": full.get("snippet",""),
-        })
-    return out
-
-
-def _gmail_send(to_list, subject, body):
-    svc = _gmail_service()
-    msg = MIMEText(body, _subtype="plain", _charset="utf-8")
-    msg["to"] = ", ".join(to_list or [])
-    msg["subject"] = subject or ""
-    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
-    sent = svc.users().messages().send(userId="me", body={"raw": raw}).execute()
-    return sent.get("id")
-
-def _draft_email_with_context(user_prompt: str):
-    recent = _gmail_recent(10)
-    context_lines = []
-    for r in recent:
-        line = f"FROM: {r['from']} | SUBJECT: {r['subject']} | SNIPPET: {r['snippet']}"
-        context_lines.append(line)
-    context = "\n".join(context_lines)
-    if not llm_client:
-        return False, "LLM disabled: FASTR_API_KEY not set."
-    sys = {
-        "role":"system",
-        "content":(
-            "Write a professional email draft.\n"
-            "Return strict JSON: {\"to\":[...],\"subject\":\"...\",\"body\":\"...\"}.\n"
-            "Use the provided context only if it helps; do not leak unrelated details.\n"
-            "Prefer the recipient(s) explicitly mentioned by the user; otherwise infer none."
-        )
-    }
-    msgs = [
-        sys,
-        {"role":"user","content":f"CONTEXT (last 10 emails):\n{context}\n\nUSER REQUEST:\n{user_prompt}"}
-    ]
-    resp = llm_client.chat.completions.create(
-        model=LLM_MODEL, messages=msgs, temperature=0.3, max_tokens=600
-    )
-    txt = resp.choices[0].message.content
-    try:
-        start, end = txt.find("{"), txt.rfind("}")
-        draft = json.loads(txt[start:end+1]) if start!=-1 and end!=-1 else json.loads(txt)
-        to_list = draft.get("to") or []
-        if isinstance(to_list, str):
-            to_list = [to_list]
-        return True, {"to": to_list, "subject": draft.get("subject",""), "body": draft.get("body","")}
-    except Exception as e:
-        return False, f"Draft parse failed: {txt} ({e})"
-    
-def _open_gmail_compose(to_list, subject, body):
-    to_param = ",".join(to_list or [])
-    url = ("https://mail.google.com/mail/?view=cm&fs=1"
-           f"&to={urllib.parse.quote(to_param)}"
-           f"&su={urllib.parse.quote(subject or '')}"
-           f"&body={urllib.parse.quote(body or '')}")
-    if DRY_RUN:
-        return f"(DRY_RUN) Would open compose: {url}"
-    webbrowser.open(url)
-    return f"Opened Gmail compose with prefilled draft."
-
-def _gmail_search(query: str, n: int = 25):
-    svc = _gmail_service()
-    resp = svc.users().messages().list(userId="me", q=query, maxResults=n).execute()
-    return resp.get("messages", [])
-
-def _gmail_get_full_message(msg_id: str):
-    svc = _gmail_service()
-    m = svc.users().messages().get(userId="me", id=msg_id, format="full").execute()
-    payload = m.get("payload", {})
-    headers = {h["name"].lower(): h["value"] for h in payload.get("headers", [])}
-
-    def _walk_parts(p):
-        if not p:
-            return []
-        if p.get("mimeType", "").startswith("multipart/"):
-            parts = p.get("parts", []) or []
-            out = []
-            for sub in parts:
-                out.extend(_walk_parts(sub))
-            return out
-        else:
-            return [p]
-
-    def _decode_body(b64):
-        try:
-            return base64.urlsafe_b64decode(b64.encode("utf-8")).decode("utf-8", errors="ignore")
-        except Exception:
-            return ""
-
-    parts = _walk_parts(payload) or []
-    text_plain, text_html = "", ""
-    for p in parts:
-        mt = p.get("mimeType", "")
-        data = p.get("body", {}).get("data")
-        if not data:
-            continue
-        decoded = _decode_body(data)
-        if mt == "text/plain" and not text_plain:
-            text_plain = decoded
-        elif mt == "text/html" and not text_html:
-            text_html = decoded
-
-    if not text_plain and text_html:
-        text = re.sub(r"<(script|style)[^>]*>.*?</\\1>", "", text_html, flags=re.S|re.I)
-        text = re.sub(r"<br\\s*/?>", "\n", text, flags=re.I)
-        text = re.sub(r"</p\\s*>", "\n", text, flags=re.I)
-        text = re.sub(r"<[^>]+>", "", text)
-        text = htmllib.unescape(text)
-        text_plain = re.sub(r"[ \\t]+", " ", text).strip()
-
-    return {
-        "id": m.get("id"),
-        "threadId": m.get("threadId"),
-        "from": headers.get("from", ""),
-        "to": headers.get("to", ""),
-        "subject": headers.get("subject", ""),
-        "date": headers.get("date", ""),
-        "snippet": m.get("snippet", ""),
-        "body": text_plain or "",
-    }
-
-def _gmail_fetch_messages(query: str, limit: int = 25):
-    ids = _gmail_search(query, n=min(limit, 30))
-    out = []
-    for item in ids[:limit]:
-        try:
-            out.append(_gmail_get_full_message(item["id"]))
-        except Exception:
-            continue
-    return out
-
-def _extractive_summary(messages: list) -> str:
-    if not messages:
-        return "No matching emails found."
-    subjects = [m.get("subject","").strip() for m in messages if m.get("subject")]
-    top_subjects = Counter(subjects).most_common(5)
-    senders = [m.get("from","") for m in messages]
-    top_senders = Counter(senders).most_common(3)
-    bullets = []
-    bullets.append(f"Matched {len(messages)} emails.")
-    if top_senders:
-        bullets.append("Top senders: " + ", ".join(f"{s} ({n})" for s,n in top_senders))
-    if top_subjects:
-        bullets.append("Frequent subjects: " + "; ".join(f"“{s}” ×{n}" for s,n in top_subjects))
-    for m in messages[:5]:
-        bullets.append(f"- {m.get('date','')}: {m.get('subject','(no subject)')}")
-    return "\n".join(bullets)
-
-def _summarize_emails_with_llm(messages: list, user_request: str = "", timeout_s: int = 20):
-    if not llm_client:
-        return False, "LLM disabled: FASTR_API_KEY not set."
-    def clip(s, n=800):
-        return (s[:n] + "…") if len(s) > n else s
-    bundle = []
-    for m in messages:
-        bundle.append(
-            f"FROM: {m.get('from','')}\n"
-            f"SUBJECT: {m.get('subject','')}\n"
-            f"DATE: {m.get('date','')}\n"
-            f"BODY:\n{clip(m.get('body',''))}\n---"
-        )
-    context = "\n".join(bundle) if bundle else "(no messages)"
-    sys = {
-        "role": "system",
-        "content": (
-            "You are Ainek, a casual, friendly assistant for blind users. "
-            "Summarize emails in clear, short bullets. Extract key points, decisions, dates, and action items. "
-            "Output:\n- Quick summary (3–6 bullets)\n- Action items\n- Notable dates/links\n"
-        )
-    }
-    usr = {"role": "user", "content": f"{user_request}\n\nEmails:\n{context}"}
-    result = {"ok": False, "text": None, "err": None}
-    def run():
-        try:
-            resp = llm_client.chat.completions.create(
-                model=LLM_MODEL, messages=[sys, usr], temperature=0.2, max_tokens=600
-            )
-            result["ok"] = True
-            result["text"] = resp.choices[0].message.content.strip()
-        except Exception as e:
-            result["err"] = str(e)
-    t = threading.Thread(target=run, daemon=True)
-    t.start()
-    t.join(timeout_s)
-    if not result["ok"]:
-        fb = _extractive_summary(messages)
-        return True, fb
-    return True, result["text"]
-
-def _sender_to_query(sender: str) -> str:
-    s = (sender or "").strip().lower()
-    common = {
-        "linkedin": "(from:linkedin.com OR from:*@linkedin.com)",
-        "github": "(from:github.com OR from:*@github.com)",
-        "google": "(from:google.com OR from:*@google.com)",
-        "facebook": "(from:facebookmail.com OR from:*@facebookmail.com)",
-        "twitter": "(from:twitter.com OR from:*@twitter.com)",
-    }
-    return common.get(s, f"from:{sender}")
-
-def _parse_date_range_from_text(text: str):
-    if not text:
-        return None
-    t = text.lower().strip()
-    pat = re.compile(
-        r"\b(?:from|between)\s+"
-        r"(?:(\d{1,2})\s+)?"
-        r"(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{4})"
-        r"\s+(?:to|until|-)\s+"
-        r"(?:(\d{1,2})\s+)?"
-        r"(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{4})\b"
-    )
-    m = pat.search(t)
-    if not m:
-        return None
-    d1, m1, y1, d2, m2, y2 = m.groups()
-    m1n = _MONTHS[m1]; y1 = int(y1)
-    m2n = _MONTHS[m2]; y2 = int(y2)
-    if d1: d1 = int(d1)
-    else: d1 = 1
-    if d2: d2 = int(d2)
-    else: d2 = calendar.monthrange(y2, m2n)[1]
-    start = date(y1, m1n, d1)
-    end_inclusive = date(y2, m2n, d2)
-    before = end_inclusive + timedelta(days=1)
-    return {
-        "after": f"{start.year:04d}/{start.month:02d}/{start.day:02d}",
-        "before": f"{before.year:04d}/{before.month:02d}/{before.day:02d}",
-    }
-
-# ---- Routes ----
-@app.route("/", methods=["GET"])
-def index():
-    return render_template_string(HTML, result="")
-
-
-@app.route("/open", methods=["POST"])
-def open_route():
-    prompt = request.form.get("prompt", "").strip()
-    if not prompt:
-        return render_template_string(HTML, result="Please provide a prompt.")
-    user_entry = {"id": f"u-{int(time.time()*1000)}", "sender": "user", "text": prompt, "time": time.time()}
-    _add_history_entry(user_entry)
-    ok, resp = _ask_llm_for_intent(prompt, CHAT_HISTORY)
-    if not ok:
-        bot_entry = {"id": f"b-{int(time.time()*1000)}", "sender": "bot", "text": resp, "time": time.time()}
-        _add_history_entry(bot_entry)
-        return render_template_string(HTML, result=resp)
-    intent = resp.get("intent")
-    app_name = resp.get("app")
-    reply_text = resp.get("reply") or ""
-    if intent == "scroll_reels":
-        def bg_scroll():
-            success_bg, msg_bg = _open_instagram_reels_and_autoscroll()
-            bot_entry_bg = {
-                "id": f"b-{int(time.time()*1000)}",
-                "sender": "bot",
-                "text": f"{reply_text} ({msg_bg})",
-                "time": time.time(),
-            }
-            _add_history_entry(bot_entry_bg)
-        threading.Thread(target=bg_scroll, daemon=True).start()
-        start_msg = f"{reply_text} (Starting Instagram Reels autoscroll every {REELS_SCROLL_INTERVAL}s for {REELS_SCROLL_STEPS} steps)"
-        bot_entry = {"id": f"b-{int(time.time()*1000)}", "sender": "bot", "text": start_msg, "time": time.time()}
-        _add_history_entry(bot_entry)
-        return render_template_string(HTML, result=start_msg)
-    if intent == "stop_reels":
-        REELS_CANCEL.set()
-        msg = reply_text or "Stopping reels autoscroll."
-        bot_entry = {"id": f"b-{int(time.time()*1000)}", "sender": "bot", "text": msg, "time": time.time()}
-        _add_history_entry(bot_entry)
-        return render_template_string(HTML, result=msg)
-    if intent == "open_app" and app_name:
-        success, msg = _open_app_by_name_from_llm(app_name)
-        full_reply = f"{reply_text} ({msg})"
-        bot_entry = {"id": f"b-{int(time.time()*1000)}", "sender": "bot", "text": full_reply, "time": time.time()}
-        _add_history_entry(bot_entry)
-        return render_template_string(HTML, result=full_reply)
-    else:
-        bot_entry = {"id": f"b-{int(time.time()*1000)}", "sender": "bot", "text": reply_text, "time": time.time()}
-        _add_history_entry(bot_entry)
-        return render_template_string(HTML, result=reply_text)
-
-
 @app.route("/api/open", methods=["POST", "OPTIONS"])
 def open_api():
     if request.method == "OPTIONS":
         return jsonify({"ok": True}), 200
     ok_req, errmsg = _require_api_key(request)
     if not ok_req:
-    ok_req, errmsg = _require_api_key(request)
-    if not ok_req:
         return jsonify({"ok": False, "error": errmsg}), 401
+
     data = request.get_json(force=True, silent=True) or {}
     prompt = (data.get("prompt") or "").strip()
     if not prompt:
@@ -1357,6 +978,4 @@ def api_search():
     return jsonify({"ok": True, "query": q, "results": results_or_err, "readable": tts, "markdown": md}), 200
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=int(os.environ.get("FLASK_PORT", 5003)), debug=False, threaded=True)
-
     app.run(host="127.0.0.1", port=int(os.environ.get("FLASK_PORT", 5003)), debug=False, threaded=True)

@@ -14,14 +14,31 @@ export default function Landing({ apiBase = "http://127.0.0.1:5003", apiKey = nu
   const [history, setHistory] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+
+  // ✅ Use the ScrollArea ref directly (shadcn forwards it to the viewport)
   const listRef = useRef(null);
+  // ✅ Bottom sentinel that we always scroll into view
+  const bottomRef = useRef(null);
+
   const base = apiBase?.replace(/\/$/, "");
 
+  // Always stick to the newest message
   useEffect(() => {
+    // Prefer sentinel for robust behavior
+    bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+
+    // Fallback: direct scroll if needed
     if (listRef.current) {
-      listRef.current.scrollTo({ top: listRef.current.scrollHeight, behavior: "smooth" });
+      const el = listRef.current;
+      // Some shadcn builds wrap viewport; this keeps us safe
+      const viewport =
+        el.querySelector?.("[data-radix-scroll-area-viewport]") || el;
+      viewport.scrollTo({
+        top: viewport.scrollHeight,
+        behavior: "smooth",
+      });
     }
-  }, [history]);
+  }, [history, loading]);
 
   const append = (entry) => setHistory((h) => [...h, entry]);
 
@@ -29,12 +46,7 @@ export default function Landing({ apiBase = "http://127.0.0.1:5003", apiKey = nu
     const text = (textOverride || prompt).trim();
     if (!text) return;
 
-  async function sendPrompt(textOverride = null) {
-    const text = (textOverride || prompt).trim();
-    if (!text) return;
-
     append({ id: `u-${Date.now()}`, sender: "user", text, time: new Date().toISOString() });
-    if (!textOverride) setPrompt("");
     if (!textOverride) setPrompt("");
     setLoading(true);
     setError(null);
@@ -57,12 +69,9 @@ export default function Landing({ apiBase = "http://127.0.0.1:5003", apiKey = nu
 
       const reply = json?.summary || json?.message || (json?.ok ? "OK" : "Failed");
       append({ id: `b-${Date.now()}`, sender: "ainek", text: reply, time: new Date().toISOString() });
-      const reply = json?.summary || json?.message || (json?.ok ? "OK" : "Failed");
-      append({ id: `b-${Date.now()}`, sender: "ainek", text: reply, time: new Date().toISOString() });
     } catch (e) {
       console.error(e);
       setError(e.message || "Request failed");
-      append({ id: `b-err-${Date.now()}`, sender: "ainek", text: `Error: ${e.message}` });
       append({ id: `b-err-${Date.now()}`, sender: "ainek", text: `Error: ${e.message}` });
     } finally {
       setLoading(false);
@@ -108,7 +117,8 @@ export default function Landing({ apiBase = "http://127.0.0.1:5003", apiKey = nu
                 </div>
               )}
               <Separator className="my-0" />
-              <ScrollArea className="flex-1 p-4" viewportRef={listRef}>
+              {/* ✅ Attach ref directly to ScrollArea; ensure it can flex to fill */}
+              <ScrollArea ref={listRef} className="flex-1 p-4">
                 <div className="space-y-3">
                   {history.map((m) => (
                     <div key={m.id} className={`flex ${m.sender === "user" ? "justify-end" : "justify-start"}`}>
@@ -139,6 +149,9 @@ export default function Landing({ apiBase = "http://127.0.0.1:5003", apiKey = nu
                       </div>
                     </div>
                   )}
+
+                  {/* ✅ Bottom sentinel */}
+                  <div ref={bottomRef} />
                 </div>
               </ScrollArea>
             </CardContent>
@@ -155,7 +168,7 @@ export default function Landing({ apiBase = "http://127.0.0.1:5003", apiKey = nu
               onChange={(e) => setPrompt(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && sendPrompt()}
               placeholder='Type here, or just speak — Ainek is always listening'
-              className = "text-[2rem]"
+              className="text-[2rem]"
             />
             <Button onClick={() => sendPrompt()} disabled={loading}>
               {loading ? "Sending…" : "Send"}
