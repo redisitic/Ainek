@@ -29,7 +29,12 @@ export default function Landing({ apiBase = "http://127.0.0.1:5003", apiKey = nu
     const text = (textOverride || prompt).trim();
     if (!text) return;
 
+  async function sendPrompt(textOverride = null) {
+    const text = (textOverride || prompt).trim();
+    if (!text) return;
+
     append({ id: `u-${Date.now()}`, sender: "user", text, time: new Date().toISOString() });
+    if (!textOverride) setPrompt("");
     if (!textOverride) setPrompt("");
     setLoading(true);
     setError(null);
@@ -52,9 +57,12 @@ export default function Landing({ apiBase = "http://127.0.0.1:5003", apiKey = nu
 
       const reply = json?.summary || json?.message || (json?.ok ? "OK" : "Failed");
       append({ id: `b-${Date.now()}`, sender: "ainek", text: reply, time: new Date().toISOString() });
+      const reply = json?.summary || json?.message || (json?.ok ? "OK" : "Failed");
+      append({ id: `b-${Date.now()}`, sender: "ainek", text: reply, time: new Date().toISOString() });
     } catch (e) {
       console.error(e);
       setError(e.message || "Request failed");
+      append({ id: `b-err-${Date.now()}`, sender: "ainek", text: `Error: ${e.message}` });
       append({ id: `b-err-${Date.now()}`, sender: "ainek", text: `Error: ${e.message}` });
     } finally {
       setLoading(false);
