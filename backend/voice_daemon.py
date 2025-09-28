@@ -9,7 +9,6 @@ import tempfile
 import numpy as np
 import sounddevice as sd
 from dotenv import load_dotenv
-
 import pyttsx3
 
 # ---- env ----
@@ -27,7 +26,10 @@ WHISPER_DEVICE_ENV = os.getenv("WHISPER_DEVICE", "").strip().lower()
 
 audio_q = queue.Queue()
 tts_q = queue.Queue()
-SPEECH_ACTIVE = threading.Event()
+
+SPEECH_ACTIVE = threading.Event()  # TTS speaking -> ignore mic
+MIC_MUTED = threading.Event()      # Hotkey toggled mute
+MUTEX = threading.Lock()           # tiny guard for prints/state
 
 try:
     import win32com.client as wincl
@@ -68,8 +70,6 @@ def _whisper_init():
 
 def transcribe(audio_bytes: bytes) -> str:
     _whisper_init()
-    import whisper
-
     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
         tmp.write(audio_bytes)
         tmp_path = tmp.name
@@ -130,7 +130,7 @@ def speak(text: str):
         tts_q.put(text)
 
 
-# ---- Orchestration ----
+# ---- Backend call + orchestration ----
 def handle_phrase(audio: np.ndarray):
     import requests
 
@@ -164,6 +164,57 @@ def handle_phrase(audio: np.ndarray):
     speak(reply)
 
 
+# ---- Hotkey (Shift+1) to toggle mute ----
+def _toggle_mic():
+    with MUTEX:
+        if MIC_MUTED.is_set():
+            MIC_MUTED.clear()
+            print("[Hotkey] Mic UNMUTED")
+        else:
+            MIC_MUTED.set()
+            print("[Hotkey] Mic MUTED")
+
+
+def hotkey_worker():
+    """
+    Prefer 'keyboard' if available (simple global hotkeys).
+    Fall back to 'pynput' if not.
+    """
+    try:
+        import keyboard  # pip install keyboard (Linux may require root/udev)
+        keyboard.add_hotkey('shift+1', _toggle_mic)
+        print("Hotkey ready: Shift+1 to mute/unmute")
+        keyboard.wait()  # block this thread
+    except Exception:
+        try:
+            from pynput import keyboard as kb  # pip install pynput
+            pressed = set()
+
+            def on_press(key):
+                try:
+                    if key in (kb.Key.shift, kb.Key.shift_l, kb.Key.shift_r):
+                        pressed.add('shift')
+                    elif hasattr(key, 'char') and key.char == '1':
+                        if 'shift' in pressed:
+                            _toggle_mic()
+                except Exception:
+                    pass
+
+            def on_release(key):
+                try:
+                    if key in (kb.Key.shift, kb.Key.shift_l, kb.Key.shift_r):
+                        pressed.discard('shift')
+                except Exception:
+                    pass
+
+            print("Hotkey ready (pynput): Shift+1 to mute/unmute")
+            with kb.Listener(on_press=on_press, on_release=on_release) as listener:
+                listener.join()
+        except Exception as e:
+            print(f"Hotkey disabled (no backend available): {e}")
+
+
+# ---- Mic listen loop ----
 def listen_loop():
     with sd.InputStream(
         callback=_audio_cb,
@@ -172,13 +223,20 @@ def listen_loop():
         blocksize=BLOCK_SIZE,
         dtype="float32",
     ):
-        print("Ainek is always listening... speak any time.")
+        print("Ainek is always listening... speak any time. (Shift+1 to mute/unmute)")
         buf, speaking, last_voice = [], False, time.time()
         while True:
             block = audio_q.get().squeeze()
 
+            # If TTS is speaking, drop any buffered input.
             if SPEECH_ACTIVE.is_set():
                 buf, speaking = [], False
+                continue
+
+            # If mic is muted, keep draining but ignore audio; also clear any partial buffer.
+            if MIC_MUTED.is_set():
+                if buf or speaking:
+                    buf, speaking = [], False
                 continue
 
             buf.append(block)
@@ -197,6 +255,10 @@ def listen_loop():
 if __name__ == "__main__":
     t = threading.Thread(target=tts_worker, daemon=True)
     t.start()
+
+    hk = threading.Thread(target=hotkey_worker, daemon=True)
+    hk.start()
+
     try:
         listen_loop()
     finally:

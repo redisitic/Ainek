@@ -5,6 +5,7 @@ import webbrowser
 import logging
 import json
 import calendar
+import unicodedata
 from datetime import date, timedelta
 import re
 import html as htmllib
@@ -13,17 +14,19 @@ from collections import Counter
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify, render_template_string
 import pyautogui
-
 import urllib.parse
 from email.mime.text import MIMEText
 import base64
+import requests
+
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
-logging.getLogger("googleapiclient.discovery_cache").setLevel(logging.ERROR)
 
 from openai import OpenAI
+
+logging.getLogger("googleapiclient.discovery_cache").setLevel(logging.ERROR)
 
 load_dotenv()
 
@@ -86,6 +89,15 @@ HTML = """
 <div id="result">{{ result }}</div>
 """
 
+# --- JSON sanitize helpers ---
+SMARTS = {
+    ord('“'): '"', ord('”'): '"', ord('„'): '"', ord('‟'): '"',
+    ord('’'): "'", ord('‘'): "'", ord('‚'): "'", ord('ʼ'): "'",
+    ord('\u00A0'): ' ',  # nbsp
+}
+CODEFENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", flags=re.I | re.M)
+FIRST_JSON_OBJECT_RE = re.compile(r"\{.*\}", re.S)
+
 API_KEY = os.environ.get("FLASK_API_KEY", None)
 DRY_RUN = os.environ.get("DRY_RUN", "0") == "1"
 
@@ -96,6 +108,10 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "anthropic/claude-sonnet-4-20250514")
 REELS_SCROLL_INTERVAL = int(os.environ.get("REELS_SCROLL_INTERVAL", "8"))
 REELS_SCROLL_STEPS = int(os.environ.get("REELS_SCROLL_STEPS", "45"))
 REELS_CANCEL = threading.Event()
+
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
+GOOGLE_CSE_ID = os.environ.get("GOOGLE_CSE_ID")
+SEARCH_MAX_RESULTS = int(os.environ.get("SEARCH_MAX_RESULTS", "5"))
 
 if not FASTR_API_KEY:
     app.logger.warning("FASTR_API_KEY is not set. LLM calls are disabled until FASTR_API_KEY is provided.")
@@ -108,11 +124,10 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CRED_PATH = os.environ.get("GMAIL_CREDENTIALS_PATH") or os.path.join(APP_DIR, "credentials.json")
 TOKEN_PATH = os.environ.get("GMAIL_TOKEN_PATH") or os.path.join(APP_DIR, "token.json")
 
-
+# ---------------- core utils ----------------
 def _add_history_entry(entry: dict):
     with CHAT_LOCK:
         CHAT_HISTORY.append(entry)
-
 
 def _search_and_open(query: str):
     try:
@@ -128,7 +143,6 @@ def _search_and_open(query: str):
     except Exception as e:
         app.logger.exception("Error searching and opening app")
         return False, f"Error searching and opening '{query}': {e}"
-
 
 def _open_mapped_target(key: str):
     try:
@@ -151,7 +165,6 @@ def _open_mapped_target(key: str):
         app.logger.exception("Error opening mapped target")
         return False, f"Error opening mapped '{key}': {e}"
 
-
 def _open_app_by_name_from_llm(app_name_raw: str):
     app_name_raw = (app_name_raw or "").strip()
     if not app_name_raw:
@@ -161,42 +174,41 @@ def _open_app_by_name_from_llm(app_name_raw: str):
         return _open_mapped_target(key)
     return _search_and_open(app_name_raw)
 
-
+# ---------------- LLM intent ----------------
 def _build_messages_for_llm(prompt: str, history_entries: list):
     system_msg = {
         "role": "system",
-        "content": (
+        "content":
             "You are Ainek: a casual, friendly assistant for blind users. "
-            "You can use mild slang and speak informally, but keep answers clear and task-focused.\n"
-            "Decide user intent as exactly one of: ",
+            "Decide user intent as exactly one of: "
             "\"open_app\", \"scroll_reels\", \"stop_reels\", "
             "\"compose_email\", \"send_email\", \"discard_email\", "
-            "\"summarize_emails\", \"chat\".\n"
-            "Return ONLY JSON with keys:\n"
-            "  \"intent\" (one of the above),\n"
-            "  \"app\" (string when intent is \"open_app\"; else null),\n"
-            "  \"to\" (array for compose; else null),\n"
-            "  \"subject\" (string for compose; else null),\n"
-            "  \"body\" (string for compose; else null),\n"
-            "  \"sender\" (string email or name for summarize_emails; else null),\n"
-            "  \"query\" (string Gmail query for summarize_emails; else null),\n"
-            "  \"limit\" (int for summarize_emails; else null),\n"
-            "  \"reply\" (casual, short confirmation line).\n"
+            "\"summarize_emails\", \"web_search\", \"chat\".\n"
+            "Return ONLY a single JSON object. Do not include code fences, explanations, or extra text.\n"
+            "Keys:\n"
+            "  \"intent\" (string),\n"
+            "  \"app\" (string or null),\n"
+            "  \"to\" (array or null),\n"
+            "  \"subject\" (string or null),\n"
+            "  \"body\" (string or null),\n"
+            "  \"sender\" (string or null),\n"
+            "  \"query\" (string or null),\n"
+            "  \"limit\" (integer or null),\n"
+            "  \"search_query\" (string or null),\n"
+            "  \"k\" (integer or null),\n"
+            "  \"reply\" (string; short confirmation).\n"
             "Rules:\n"
             "- If user asks to write/compose an email → \"compose_email\" and produce to/subject/body.\n"
             "- If user says send now → \"send_email\".\n"
             "- If user cancels → \"discard_email\".\n"
-            "- If user asks to summarize past emails (e.g., 'summarize emails from Alice last week') → \"summarize_emails\" "
-            "  and set either sender or a Gmail query like 'from:alice newer_than:7d'.\n"
-            "- Else map to appropriate existing intents or \"chat\".\n"
-            "Examples (JSON only):\n"
-            "{\"intent\":\"summarize_emails\",\"app\":null,\"to\":null,\"subject\":null,\"body\":null,"
-            "\"sender\":\"alice@example.com\",\"query\":null,\"limit\":20,"
-            "\"reply\":\"Cool—pulling Alice’s mails and recapping.\"}\n"
-            "{\"intent\":\"summarize_emails\",\"app\":null,\"to\":null,\"subject\":null,\"body\":null,"
-            "\"sender\":null,\"query\":\"from:hr@acme.com newer_than:30d\",\"limit\":50,"
-            "\"reply\":\"On it—summarizing HR threads from last month.\"}\n"
-        )
+            "- If user asks to summarize past emails → \"summarize_emails\" and set sender or Gmail query.\n"
+            "- If the user asks to look up info on the web → \"web_search\" with \"search_query\" and optional \"k\".\n"
+            "- Otherwise → \"chat\".\n"
+            "Example:\n"
+            "{\"intent\":\"web_search\",\"app\":null,\"to\":null,\"subject\":null,\"body\":null,"
+            "\"sender\":null,\"query\":null,\"limit\":null,"
+            "\"search_query\":\"what is tab restore service in chromium\",\"k\":5,"
+            "\"reply\":\"Got it—googling that and reading the top hits.\"}"
     }
     MAX_TURNS = 6
     recent = history_entries[-MAX_TURNS:] if history_entries else []
@@ -207,36 +219,68 @@ def _build_messages_for_llm(prompt: str, history_entries: list):
     msgs.append({"role": "user", "content": prompt})
     return msgs
 
+def _coerce_json_from_text(text: str):
+    if text is None:
+        raise ValueError("empty content")
+    text = unicodedata.normalize("NFKC", text)
+    text = text.replace("\ufeff", "").replace("\u200b", "")
+    text = CODEFENCE_RE.sub("", text.strip())
+    text = text.translate(SMARTS)
+    m = FIRST_JSON_OBJECT_RE.search(text)
+    if m:
+        text = m.group(0)
+    return json.loads(text)
+
+def _maybe_force_web_search(user_prompt: str, parsed: dict) -> dict:
+    if not isinstance(parsed, dict):
+        return parsed
+    intent = (parsed.get("intent") or "").lower()
+    if intent != "web_search":
+        q = (user_prompt or "").lower()
+        triggers = ("search", "google", "look up", "find info", "what is", "latest", "news", "review", "spec")
+        if any(t in q for t in triggers) and not any(parsed.get(k) for k in ("to","subject","body","app","sender","query")):
+            parsed["intent"] = "web_search"
+            parsed["search_query"] = parsed.get("search_query") or user_prompt.strip()
+            parsed["k"] = parsed.get("k") or SEARCH_MAX_RESULTS
+    return parsed
 
 def _ask_llm_for_intent(prompt: str, history_entries: list):
     if not llm_client:
         return False, "LLM disabled: FASTR_API_KEY not set (FastRouter only)."
     messages = _build_messages_for_llm(prompt, history_entries)
     try:
-        resp = llm_client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=messages,
-            temperature=0.7,
-            max_tokens=300,
-        )
-        text = resp.choices[0].message.content
+        parsed = None
+        # Try JSON mode if supported by your router
         try:
-            parsed = json.loads(text)
-            return True, parsed
+            resp = llm_client.chat.completions.create(
+                model=LLM_MODEL, messages=messages,
+                temperature=0.7, max_tokens=300,
+                response_format={"type": "json_object"},
+            )
+            content = resp.choices[0].message.content
+            parsed = json.loads(content)
         except Exception:
-            start = text.find("{")
-            end = text.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                try:
-                    parsed = json.loads(text[start:end+1])
-                    return True, parsed
-                except Exception:
-                    return False, f"LLM responded but JSON parse failed. Raw: {text}"
-            return False, f"LLM responded but did not return JSON. Raw: {text}"
+            resp = llm_client.chat.completions.create(
+                model=LLM_MODEL, messages=messages,
+                temperature=0.7, max_tokens=300,
+            )
+            content = resp.choices[0].message.content
+            parsed = _coerce_json_from_text(content)
+        parsed = _maybe_force_web_search(prompt, parsed)
+        return True, parsed
     except Exception as e:
-        app.logger.exception("LLM call failed")
-        return False, f"LLM error: {e}"
-
+        # Last-resort brace slice
+        try:
+            content = locals().get("content", "")
+            start, end = (content or "").find("{"), (content or "").rfind("}")
+            if start != -1 and end > start:
+                parsed = json.loads(content[start:end+1])
+                parsed = _maybe_force_web_search(prompt, parsed)
+                return True, parsed
+        except Exception:
+            pass
+        app.logger.warning("JSON parse failed; raw=%r", locals().get("content", ""))
+        return False, f"LLM responded but JSON parse failed. Raw: {locals().get('content','')}"
 
 def _require_api_key(req):
     if not API_KEY:
@@ -248,6 +292,7 @@ def _require_api_key(req):
         return False, "Invalid API key"
     return True, ""
 
+# ---------------- reels ----------------
 def _open_instagram_reels_and_autoscroll(interval: int = REELS_SCROLL_INTERVAL, steps: int = REELS_SCROLL_STEPS):
     try:
         if DRY_RUN:
@@ -278,6 +323,7 @@ def _open_instagram_reels_and_autoscroll(interval: int = REELS_SCROLL_INTERVAL, 
         app.logger.exception("Error during Reels autoscroll")
         return False, f"Autoscroll error: {e}"
 
+# ---------------- Gmail ----------------
 def _gmail_service():
     creds = None
     if os.path.exists(TOKEN_PATH):
@@ -310,7 +356,6 @@ def _gmail_recent(n=10):
             "snippet": full.get("snippet",""),
         })
     return out
-
 
 def _gmail_send(to_list, subject, body):
     svc = _gmail_service()
@@ -356,7 +401,7 @@ def _draft_email_with_context(user_prompt: str):
         return True, {"to": to_list, "subject": draft.get("subject",""), "body": draft.get("body","")}
     except Exception as e:
         return False, f"Draft parse failed: {txt} ({e})"
-    
+
 def _open_gmail_compose(to_list, subject, body):
     to_param = ",".join(to_list or [])
     url = ("https://mail.google.com/mail/?view=cm&fs=1"
@@ -538,11 +583,70 @@ def _parse_date_range_from_text(text: str):
         "before": f"{before.year:04d}/{before.month:02d}/{before.day:02d}",
     }
 
-# ---- Routes ----
+# ---------------- Google Search ----------------
+def _google_search(query: str, k: int = SEARCH_MAX_RESULTS):
+    """
+    Returns (ok, results_or_error). results_or_error is a list of dicts:
+    {title, link, snippet, displayLink}
+    """
+    if not GOOGLE_API_KEY or not GOOGLE_CSE_ID:
+        return False, "Google search is not configured. Set GOOGLE_API_KEY and GOOGLE_CSE_ID."
+    k = max(1, min(int(k or 5), 10))
+    try:
+        r = requests.get(
+            "https://www.googleapis.com/customsearch/v1",
+            params={"key": GOOGLE_API_KEY, "cx": GOOGLE_CSE_ID, "q": query, "num": k},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return False, f"Google CSE error {r.status_code}: {r.text[:200]}"
+        data = r.json()
+        items = data.get("items", []) or []
+        results = []
+        for it in items:
+            results.append({
+                "title": it.get("title", "").strip(),
+                "link": it.get("link", ""),
+                "snippet": (it.get("snippet") or it.get("htmlSnippet") or "").strip(),
+                "displayLink": it.get("displayLink", ""),
+            })
+        return True, results
+    except Exception as e:
+        app.logger.exception("Google CSE call failed")
+        return False, f"Search failed: {e}"
+
+def _render_search_results_text(query: str, results: list) -> str:
+    """Plain text (good for TTS)."""
+    if not results:
+        return f"No results for: {query}"
+    lines = [f"Top {len(results)} results for: {query}"]
+    for i, r in enumerate(results, 1):
+        title = r.get("title") or "(no title)"
+        snippet = r.get("snippet") or "(no snippet)"
+        dom = r.get("displayLink") or ""
+        link = r.get("link") or ""
+        lines.append(f"{i}. {title}\n   {snippet}\n   Source: {dom}\n   Link: {link}")
+    return "\n".join(lines)
+
+def _render_search_results_markdown(query: str, results: list) -> str:
+    """Markdown for your ReactMarkdown bubble."""
+    if not results:
+        return f"**No results** for: `{query}`"
+    lines = [f"**Top {len(results)} results for:** `{query}`", ""]
+    for i, r in enumerate(results, 1):
+        title = r.get("title") or "(no title)"
+        link = r.get("link") or ""
+        dom = r.get("displayLink") or ""
+        snippet = (r.get("snippet") or "").replace("\n", " ").strip()
+        lines.append(f"{i}. [{title}]({link})  _(source: {dom})_")
+        if snippet:
+            lines.append(f"   - {snippet}")
+    return "\n".join(lines)
+
+# ---------------- Routes ----------------
 @app.route("/", methods=["GET"])
 def index():
     return render_template_string(HTML, result="")
-
 
 @app.route("/open", methods=["POST"])
 def open_route():
@@ -551,14 +655,32 @@ def open_route():
         return render_template_string(HTML, result="Please provide a prompt.")
     user_entry = {"id": f"u-{int(time.time()*1000)}", "sender": "user", "text": prompt, "time": time.time()}
     _add_history_entry(user_entry)
+
     ok, resp = _ask_llm_for_intent(prompt, CHAT_HISTORY)
     if not ok:
         bot_entry = {"id": f"b-{int(time.time()*1000)}", "sender": "bot", "text": resp, "time": time.time()}
         _add_history_entry(bot_entry)
         return render_template_string(HTML, result=resp)
+
     intent = resp.get("intent")
     app_name = resp.get("app")
     reply_text = resp.get("reply") or ""
+
+    if intent == "web_search":
+        q = (resp.get("search_query") or prompt or "").strip()
+        k = int(resp.get("k") or SEARCH_MAX_RESULTS)
+        ok_s, results_or_err = _google_search(q, k=k)
+        if not ok_s:
+            msg = f"{reply_text or 'Could not search.'} ({results_or_err})"
+            _add_history_entry({"id": f"b-{int(time.time()*1000)}","sender":"bot","text": msg,"time": time.time()})
+            return render_template_string(HTML, result=msg)
+        md = _render_search_results_markdown(q, results_or_err)
+        tts = _render_search_results_text(q, results_or_err)
+        _add_history_entry({"id": f"b-{int(time.time()*1000)}","sender":"bot","text": reply_text or "Here’s what I found:", "time": time.time()})
+        _add_history_entry({"id": f"b-{int(time.time()*1000)}","sender":"bot","text": md, "time": time.time()})
+        # The minimal HTML page shows plain text; your SPA will render markdown via /api/open
+        return render_template_string(HTML, result=f"{reply_text or 'Here’s what I found:'}\n\n{tts}")
+
     if intent == "scroll_reels":
         def bg_scroll():
             success_bg, msg_bg = _open_instagram_reels_and_autoscroll()
@@ -571,26 +693,24 @@ def open_route():
             _add_history_entry(bot_entry_bg)
         threading.Thread(target=bg_scroll, daemon=True).start()
         start_msg = f"{reply_text} (Starting Instagram Reels autoscroll every {REELS_SCROLL_INTERVAL}s for {REELS_SCROLL_STEPS} steps)"
-        bot_entry = {"id": f"b-{int(time.time()*1000)}", "sender": "bot", "text": start_msg, "time": time.time()}
-        _add_history_entry(bot_entry)
+        _add_history_entry({"id": f"b-{int(time.time()*1000)}", "sender": "bot", "text": start_msg, "time": time.time()})
         return render_template_string(HTML, result=start_msg)
+
     if intent == "stop_reels":
         REELS_CANCEL.set()
         msg = reply_text or "Stopping reels autoscroll."
-        bot_entry = {"id": f"b-{int(time.time()*1000)}", "sender": "bot", "text": msg, "time": time.time()}
-        _add_history_entry(bot_entry)
+        _add_history_entry({"id": f"b-{int(time.time()*1000)}", "sender": "bot", "text": msg, "time": time.time()})
         return render_template_string(HTML, result=msg)
+
     if intent == "open_app" and app_name:
         success, msg = _open_app_by_name_from_llm(app_name)
         full_reply = f"{reply_text} ({msg})"
-        bot_entry = {"id": f"b-{int(time.time()*1000)}", "sender": "bot", "text": full_reply, "time": time.time()}
-        _add_history_entry(bot_entry)
+        _add_history_entry({"id": f"b-{int(time.time()*1000)}", "sender": "bot", "text": full_reply, "time": time.time()})
         return render_template_string(HTML, result=full_reply)
-    else:
-        bot_entry = {"id": f"b-{int(time.time()*1000)}", "sender": "bot", "text": reply_text, "time": time.time()}
-        _add_history_entry(bot_entry)
-        return render_template_string(HTML, result=reply_text)
 
+    # default chat
+    _add_history_entry({"id": f"b-{int(time.time()*1000)}", "sender": "bot", "text": reply_text, "time": time.time()})
+    return render_template_string(HTML, result=reply_text)
 
 @app.route("/api/open", methods=["POST", "OPTIONS"])
 def open_api():
@@ -599,47 +719,60 @@ def open_api():
     ok_req, errmsg = _require_api_key(request)
     if not ok_req:
         return jsonify({"ok": False, "error": errmsg}), 401
+
     data = request.get_json(force=True, silent=True) or {}
     prompt = (data.get("prompt") or "").strip()
     if not prompt:
         return jsonify({"ok": False, "error": "no prompt provided"}), 400
-    user_entry = {"id": f"u-{int(time.time()*1000)}", "sender": "user", "text": prompt, "time": time.time()}
-    _add_history_entry(user_entry)
+
+    _add_history_entry({"id": f"u-{int(time.time()*1000)}", "sender": "user", "text": prompt, "time": time.time()})
     ok, resp = _ask_llm_for_intent(prompt, CHAT_HISTORY)
     if not ok:
-        bot_entry = {"id": f"b-{int(time.time()*1000)}", "sender": "bot", "text": resp, "time": time.time()}
-        _add_history_entry(bot_entry)
+        _add_history_entry({"id": f"b-{int(time.time()*1000)}", "sender": "bot", "text": resp, "time": time.time()})
         return jsonify({"ok": False, "message": resp}), 500
+
     intent = resp.get("intent")
     app_name = resp.get("app")
     reply_text = resp.get("reply") or ""
+
+    if intent == "web_search":
+        q = (resp.get("search_query") or prompt or "").strip()
+        k = int(resp.get("k") or SEARCH_MAX_RESULTS)
+        ok_s, results_or_err = _google_search(q, k=k)
+        if not ok_s:
+            msg = f"{reply_text or 'Could not search.'} ({results_or_err})"
+            _add_history_entry({"id": f"b-{int(time.time()*1000)}", "sender":"bot","text": msg, "time": time.time()})
+            return jsonify({"ok": False, "message": msg}), 500
+        md = _render_search_results_markdown(q, results_or_err)
+        tts = _render_search_results_text(q, results_or_err)
+        _add_history_entry({"id": f"b-{int(time.time()*1000)}", "sender":"bot","text": reply_text or "Here’s what I found:", "time": time.time()})
+        _add_history_entry({"id": f"b-{int(time.time()*1000)}", "sender":"bot","text": md, "time": time.time()})
+        return jsonify({
+            "ok": True,
+            "message": reply_text or "Here’s what I found:",
+            "query": q,
+            "results": results_or_err,
+            "readable": tts,
+            "markdown": md
+        }), 200
+
     if intent == "scroll_reels":
         def bg_scroll():
             success_bg, msg_bg = _open_instagram_reels_and_autoscroll()
-            bot_entry_bg = {
-                "id": f"b-{int(time.time()*1000)}",
-                "sender": "bot",
-                "text": f"{reply_text} ({msg_bg})",
-                "time": time.time(),
-            }
-            _add_history_entry(bot_entry_bg)
+            _add_history_entry({"id": f"b-{int(time.time()*1000)}", "sender":"bot", "text": f"{reply_text} ({msg_bg})", "time": time.time()})
         threading.Thread(target=bg_scroll, daemon=True).start()
         return jsonify({
             "ok": True,
             "message": f"{reply_text} (Opening Instagram Reels and auto-scrolling every {REELS_SCROLL_INTERVAL}s for {REELS_SCROLL_STEPS} steps)"
         }), 202
+
     if intent == "stop_reels":
         REELS_CANCEL.set()
-        bot_entry = {"id": f"b-{int(time.time()*1000)}", "sender": "bot", "text": reply_text or "Stopping reels.", "time": time.time()}
-        _add_history_entry(bot_entry)
+        _add_history_entry({"id": f"b-{int(time.time()*1000)}", "sender":"bot","text": reply_text or "Stopping reels.", "time": time.time()})
         return jsonify({"ok": True, "message": reply_text or "Stopping reels."}), 200
+
     if intent == "compose_email":
-        payload = {
-            "prompt": prompt,
-            "to": resp.get("to"),
-            "subject": resp.get("subject"),
-            "body": resp.get("body"),
-        }
+        payload = {"prompt": prompt, "to": resp.get("to"), "subject": resp.get("subject"), "body": resp.get("body")}
         with app.test_request_context():
             with app.test_client() as c:
                 r = c.post("/api/email/draft", json=payload, headers={"X-API-Key": API_KEY} if API_KEY else {})
@@ -648,18 +781,11 @@ def open_api():
                     return jsonify({"ok": False, "message": j.get("error","draft failed")}), 500
                 draft = j["draft"]; msg = j.get("message","")
         reply = reply_text or "Draft ready."
-        preview = [
-          "Draft staged:",
-          f"To: {', '.join(draft.get('to', []))}",
-          f"Subject: {draft.get('subject','')}",
-          "",
-          draft.get("body","")
-        ]
-        bot_entry_msg = {"id": f"b-{int(time.time()*1000)}", "sender": "bot", "text": reply, "time": time.time()}
-        _add_history_entry(bot_entry_msg)
-        bot_entry_preview = {"id": f"b-{int(time.time()*1000)}", "sender": "bot", "text": "\n".join(preview), "time": time.time()}
-        _add_history_entry(bot_entry_preview)
+        preview = ["Draft staged:", f"To: {', '.join(draft.get('to', []))}", f"Subject: {draft.get('subject','')}", "", draft.get("body","")]
+        _add_history_entry({"id": f"b-{int(time.time()*1000)}", "sender":"bot", "text": reply, "time": time.time()})
+        _add_history_entry({"id": f"b-{int(time.time()*1000)}", "sender":"bot", "text": "\n".join(preview), "time": time.time()})
         return jsonify({"ok": True, "message": f"{reply} ({msg})", "draft": draft, "needs_confirmation": True}), 200
+
     if intent == "send_email":
         with app.test_request_context():
             with app.test_client() as c:
@@ -669,6 +795,7 @@ def open_api():
                 if j.get("ok"):
                     _add_history_entry({"id": f"b-{int(time.time()*1000)}", "sender":"bot","text":"Email sent.", "time": time.time()})
                 return jsonify(j), code
+
     if intent == "discard_email":
         with app.test_request_context():
             with app.test_client() as c:
@@ -678,6 +805,7 @@ def open_api():
                 if j.get("ok"):
                     _add_history_entry({"id": f"b-{int(time.time()*1000)}", "sender":"bot","text":"Draft discarded.", "time": time.time()})
                 return jsonify(j), code
+
     if intent == "summarize_emails":
         q = (resp.get("query") or "").strip()
         sender = (resp.get("sender") or "").strip()
@@ -709,26 +837,24 @@ def open_api():
         except Exception as e:
             app.logger.exception("Summarize via router failed")
             return jsonify({"ok": False, "message": f"Summarize failed: {e}"}), 500
+
     if intent == "open_app" and app_name:
         sync = request.args.get("sync") == "1"
         if sync:
             success, msg = _open_app_by_name_from_llm(app_name)
             full_reply = f"{reply_text} ({msg})"
-            bot_entry = {"id": f"b-{int(time.time()*1000)}", "sender": "bot", "text": full_reply, "time": time.time()}
-            _add_history_entry(bot_entry)
+            _add_history_entry({"id": f"b-{int(time.time()*1000)}", "sender": "bot", "text": full_reply, "time": time.time()})
             return jsonify({"ok": success, "message": full_reply}), (200 if success else 500)
         def bg_open(name, prompt_text):
             success_bg, msg_bg = _open_app_by_name_from_llm(name)
-            bot_entry_bg = {"id": f"b-{int(time.time()*1000)}", "sender": "bot", "text": f"{reply_text} ({msg_bg})", "time": time.time()}
-            _add_history_entry(bot_entry_bg)
+            _add_history_entry({"id": f"b-{int(time.time()*1000)}", "sender": "bot", "text": f"{reply_text} ({msg_bg})", "time": time.time()})
         t = threading.Thread(target=bg_open, args=(app_name, prompt), daemon=True)
         t.start()
         return jsonify({"ok": True, "message": f"{reply_text} (Opening queued: {app_name})"}), 202
-    else:
-        bot_entry = {"id": f"b-{int(time.time()*1000)}", "sender": "bot", "text": reply_text, "time": time.time()}
-        _add_history_entry(bot_entry)
-        return jsonify({"ok": True, "message": reply_text}), 200
 
+    # default chat
+    _add_history_entry({"id": f"b-{int(time.time()*1000)}", "sender": "bot", "text": reply_text, "time": time.time()})
+    return jsonify({"ok": True, "message": reply_text}), 200
 
 @app.route("/api/history", methods=["GET"])
 def api_history():
@@ -770,7 +896,6 @@ def api_email_draft():
     CURRENT_DRAFT["opened_compose"] = True if not msg.startswith("(") else False
     return jsonify({"ok": True, "draft": CURRENT_DRAFT, "message": msg, "opened_compose": CURRENT_DRAFT["opened_compose"]}), 200
 
-
 @app.route("/api/email/send", methods=["POST"])
 def api_email_send():
     ok_req, errmsg = _require_api_key(request)
@@ -787,7 +912,6 @@ def api_email_send():
     except Exception as e:
         app.logger.exception("Send failed")
         return jsonify({"ok": False, "error": f"Send failed: {e}"}), 500
-
 
 @app.route("/api/email/discard", methods=["POST"])
 def api_email_discard():
@@ -824,15 +948,34 @@ def api_email_summarize():
             return jsonify({"ok": False, "error": result}), 500
         _add_history_entry({"id": f"b-{int(time.time()*1000)}", "sender":"bot","text":"Here you go.", "time": time.time()})
         _add_history_entry({"id": f"b-{int(time.time()*1000)}", "sender":"bot","text": result, "time": time.time()})
-        return jsonify({
-            "ok": True,
-            "query": query,
-            "count": len(messages),
-            "summary": result
-        }), 200
+        return jsonify({"ok": True, "query": query, "count": len(messages), "summary": result}), 200
     except Exception as e:
         app.logger.exception("Summarize failed")
         return jsonify({"ok": False, "error": f"Summarize failed: {e}"}), 500
+
+# Direct search API (no LLM)
+@app.route("/api/search", methods=["POST", "OPTIONS"])
+def api_search():
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True}), 200
+    ok_req, errmsg = _require_api_key(request)
+    if not ok_req:
+        return jsonify({"ok": False, "error": errmsg}), 401
+    data = request.get_json(force=True, silent=True) or {}
+    q = (data.get("query") or "").strip()
+    k = int(data.get("k") or SEARCH_MAX_RESULTS)
+    if not q:
+        return jsonify({"ok": False, "error": "Provide 'query'."}), 400
+    ok_s, results_or_err = _google_search(q, k=k)
+    if not ok_s:
+        msg = f"Search failed: {results_or_err}"
+        _add_history_entry({"id": f"b-{int(time.time()*1000)}","sender":"bot","text": msg,"time": time.time()})
+        return jsonify({"ok": False, "error": msg}), 500
+    md = _render_search_results_markdown(q, results_or_err)
+    tts = _render_search_results_text(q, results_or_err)
+    _add_history_entry({"id": f"b-{int(time.time()*1000)}","sender":"bot","text": "Here’s what I found:", "time": time.time()})
+    _add_history_entry({"id": f"b-{int(time.time()*1000)}","sender":"bot","text": md, "time": time.time()})
+    return jsonify({"ok": True, "query": q, "results": results_or_err, "readable": tts, "markdown": md}), 200
 
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=int(os.environ.get("FLASK_PORT", 5003)), debug=False, threaded=True)
