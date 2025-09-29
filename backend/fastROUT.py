@@ -6,18 +6,23 @@ import logging
 import json
 import calendar
 import unicodedata
+import base64
+import requests
 from datetime import date, timedelta
 import re
 import html as htmllib
 from collections import Counter
-
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify, render_template_string
 import pyautogui
 import urllib.parse
 from email.mime.text import MIMEText
-import base64
-import requests
+from PIL import Image
+import pytesseract
+import pyperclip
+import difflib
+import subprocess
+import shutil
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -39,6 +44,18 @@ try:
 except Exception:
     app.logger.info("flask_cors not installed — continuing without it.")
 
+TESSERACT_CMD = os.getenv("TESSERACT_CMD", "").strip().strip('"').strip("'")
+if TESSERACT_CMD:
+    TESSERACT_CMD = os.path.expandvars(os.path.expanduser(TESSERACT_CMD))
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
+try:
+    _ = pytesseract.get_tesseract_version()
+    OCR_AVAILABLE = True
+except Exception as e:
+    OCR_AVAILABLE = False
+    app.logger.warning(f"Tesseract not available: {e}")
+BROWSER_PATH = os.getenv("BROWSER_PATH")
+EXPLORER_NEW_WINDOW = os.getenv("EXPLORER_NEW_WINDOW", "1") == "1"
 CHAT_HISTORY = []
 CHAT_LOCK = threading.Lock()
 
@@ -151,7 +168,11 @@ def _open_mapped_target(key: str):
             return False, f"No map target for '{key}'"
         if DRY_RUN:
             return True, f"(DRY_RUN) Would open mapped: {key} -> {target}"
-        if isinstance(target, str) and (target.startswith("http") or target.endswith(":")):
+        if isinstance(target, str) and target.startswith("http"):
+            ok, msg = _open_url_new_window(target)
+            if not ok:
+                return False, msg
+        elif isinstance(target, str) and target.endswith(":"):
             webbrowser.open(target)
         else:
             pyautogui.hotkey("win", "s")
@@ -164,6 +185,7 @@ def _open_mapped_target(key: str):
     except Exception as e:
         app.logger.exception("Error opening mapped target")
         return False, f"Error opening mapped '{key}': {e}"
+
 
 def _open_app_by_name_from_llm(app_name_raw: str):
     app_name_raw = (app_name_raw or "").strip()
@@ -183,8 +205,8 @@ def _build_messages_for_llm(prompt: str, history_entries: list):
             "Decide user intent as exactly one of: "
             "\"open_app\", \"scroll_reels\", \"stop_reels\", "
             "\"compose_email\", \"send_email\", \"discard_email\", "
-            "\"summarize_emails\", \"web_search\", \"chat\".\n"
-            "Return ONLY a single JSON object. Do not include code fences, explanations, or extra text.\n"
+            "\"summarize_emails\", \"web_search\", \"desktop_task\", \"chat\".\n"
+            "Return ONLY a single JSON object.\n"
             "Keys:\n"
             "  \"intent\" (string),\n"
             "  \"app\" (string or null),\n"
@@ -196,19 +218,16 @@ def _build_messages_for_llm(prompt: str, history_entries: list):
             "  \"limit\" (integer or null),\n"
             "  \"search_query\" (string or null),\n"
             "  \"k\" (integer or null),\n"
-            "  \"reply\" (string; short confirmation).\n"
+            "  \"instruction\" (string or null),\n"
+            "  \"reply\" (string).\n"
             "Rules:\n"
-            "- If user asks to write/compose an email → \"compose_email\" and produce to/subject/body.\n"
+            "- If filesystem or on-screen navigation is requested (open/list/click folders/files, Explorer, paths) → intent=\"desktop_task\" and put the original instruction into \"instruction\".\n"
+            "- If user asks to write/compose an email → \"compose_email\".\n"
             "- If user says send now → \"send_email\".\n"
             "- If user cancels → \"discard_email\".\n"
-            "- If user asks to summarize past emails → \"summarize_emails\" and set sender or Gmail query.\n"
-            "- If the user asks to look up info on the web → \"web_search\" with \"search_query\" and optional \"k\".\n"
-            "- Otherwise → \"chat\".\n"
-            "Example:\n"
-            "{\"intent\":\"web_search\",\"app\":null,\"to\":null,\"subject\":null,\"body\":null,"
-            "\"sender\":null,\"query\":null,\"limit\":null,"
-            "\"search_query\":\"what is tab restore service in chromium\",\"k\":5,"
-            "\"reply\":\"Got it—googling that and reading the top hits.\"}"
+            "- If user asks to summarize past emails → \"summarize_emails\".\n"
+            "- If the user asks to look up info on the web → \"web_search\".\n"
+            "- Otherwise → \"chat\"."
     }
     MAX_TURNS = 6
     recent = history_entries[-MAX_TURNS:] if history_entries else []
@@ -234,11 +253,15 @@ def _coerce_json_from_text(text: str):
 def _maybe_force_web_search(user_prompt: str, parsed: dict) -> dict:
     if not isinstance(parsed, dict):
         return parsed
+    if _is_desktopish_request(user_prompt):
+        parsed["intent"] = "desktop_task"
+        parsed["instruction"] = parsed.get("instruction") or user_prompt.strip()
+        return parsed
     intent = (parsed.get("intent") or "").lower()
     if intent != "web_search":
         q = (user_prompt or "").lower()
-        triggers = ("search", "google", "look up", "find info", "what is", "latest", "news", "review", "spec")
-        if any(t in q for t in triggers) and not any(parsed.get(k) for k in ("to","subject","body","app","sender","query")):
+        triggers = (" search ", "google", "look up", "find info", "latest", "news", "review", "spec")
+        if any(t in f" {q} " for t in triggers) and not any(parsed.get(k) for k in ("to","subject","body","app","sender","query","instruction")):
             parsed["intent"] = "web_search"
             parsed["search_query"] = parsed.get("search_query") or user_prompt.strip()
             parsed["k"] = parsed.get("k") or SEARCH_MAX_RESULTS
@@ -250,7 +273,6 @@ def _ask_llm_for_intent(prompt: str, history_entries: list):
     messages = _build_messages_for_llm(prompt, history_entries)
     try:
         parsed = None
-        # Try JSON mode if supported by your router
         try:
             resp = llm_client.chat.completions.create(
                 model=LLM_MODEL, messages=messages,
@@ -267,9 +289,10 @@ def _ask_llm_for_intent(prompt: str, history_entries: list):
             content = resp.choices[0].message.content
             parsed = _coerce_json_from_text(content)
         parsed = _maybe_force_web_search(prompt, parsed)
+        if (parsed.get("intent") == "desktop_task") and not parsed.get("instruction"):
+            parsed["instruction"] = prompt.strip()
         return True, parsed
     except Exception as e:
-        # Last-resort brace slice
         try:
             content = locals().get("content", "")
             start, end = (content or "").find("{"), (content or "").rfind("}")
@@ -643,6 +666,331 @@ def _render_search_results_markdown(query: str, results: list) -> str:
             lines.append(f"   - {snippet}")
     return "\n".join(lines)
 
+# ---------------- Desktop Search ----------------
+def _norm_text(s):
+    if s is None:
+        return ""
+    s = unicodedata.normalize("NFKC", str(s)).strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+def _screenshot(region=None):
+    if DRY_RUN:
+        return None
+    img = pyautogui.screenshot(region=region)
+    return img
+
+def _ocr_words(img):
+    if img is None or not OCR_AVAILABLE:
+        return []
+    data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+    out = []
+    n = len(data.get("text", []))
+    for i in range(n):
+        txt = data["text"][i].strip()
+        if not txt:
+            continue
+        try:
+            conf = float(data["conf"][i])
+        except Exception:
+            conf = -1.0
+        if conf < 60:
+            continue
+        out.append({
+            "text": txt,
+            "left": int(data["left"][i]),
+            "top": int(data["top"][i]),
+            "width": int(data["width"][i]),
+            "height": int(data["height"][i]),
+            "conf": conf,
+        })
+    return out
+
+def _find_click_target_by_text(target, region=None):
+    if DRY_RUN:
+        return None, 0.0
+    screen = _screenshot(region=region)
+    words = _ocr_words(screen)
+    if not words:
+        return None, 0.0
+    tnorm = _norm_text(target)
+    best = None
+    best_score = 0.0
+    for w in words:
+        score = difflib.SequenceMatcher(None, tnorm, _norm_text(w["text"])).ratio()
+        if score > best_score:
+            cx = w["left"] + w["width"] // 2
+            cy = w["top"] + w["height"] // 2
+            best = (cx, cy)
+            best_score = score
+    return best, best_score
+
+def _click_xy(x, y, double=False):
+    if DRY_RUN:
+        return True, "(DRY_RUN) click"
+    pyautogui.moveTo(x, y, duration=0.1)
+    if double:
+        pyautogui.doubleClick()
+    else:
+        pyautogui.click()
+    time.sleep(0.6)
+    return True, "clicked"
+
+def _open_explorer_window():
+    if DRY_RUN:
+        return True, "(DRY_RUN) open explorer"
+    try:
+        pyautogui.hotkey("win", "e")
+        time.sleep(1.5)
+        return True, "explorer opened"
+    except Exception as e:
+        return False, f"explorer open failed: {e}"
+
+def _addrbar_go(path_str):
+    if DRY_RUN:
+        return True, f"(DRY_RUN) go {path_str}"
+    try:
+        pyautogui.hotkey("ctrl", "l")
+        time.sleep(0.1)
+        pyautogui.typewrite(path_str)
+        pyautogui.press("enter")
+        time.sleep(1.2)
+        return True, f"navigated {path_str}"
+    except Exception as e:
+        return False, f"addrbar failed: {e}"
+
+def _expand_user_env_path(s):
+    if not s:
+        return s
+    s = os.path.expandvars(s)
+    s = os.path.expanduser(s)
+    return s
+
+def _downloads_path():
+    return os.path.join(os.path.expanduser("~"), "Downloads")
+
+def _list_dir(path_str, kind="folders"):
+    p = _expand_user_env_path(path_str)
+    if not os.path.isdir(p):
+        return False, [], f"not a directory: {p}"
+    try:
+        names = os.listdir(p)
+        if kind == "folders":
+            items = sorted([n for n in names if os.path.isdir(os.path.join(p, n))])
+        elif kind == "files":
+            items = sorted([n for n in names if os.path.isfile(os.path.join(p, n))])
+        else:
+            items = sorted(names)
+        return True, items, ""
+    except Exception as e:
+        return False, [], str(e)
+
+def _get_clipboard_path_from_explorer():
+    if DRY_RUN:
+        return ""
+    try:
+        pyautogui.hotkey("alt", "d")
+        time.sleep(0.1)
+        pyautogui.hotkey("ctrl", "c")
+        time.sleep(0.1)
+        return (pyperclip.paste() or "").strip()
+    except Exception:
+        return ""
+
+def _plan_desktop_instruction(instr):
+    def _rule_plan(t):
+        text = _norm_text(t)
+        plan = [{"action": "open_explorer"}]
+        path = None
+        mpath = re.search(r'([A-Za-z]:\\[^\n\r]+|%userprofile%[^\n\r]+|~[^\n\r]+|\\\\[^\n\r]+)', t)
+        if mpath:
+            path = mpath.group(1).strip()
+        elif "downloads" in text:
+            path = _downloads_path()
+        if path:
+            plan.append({"action": "open_path", "path": path})
+        m = re.search(r"open\s+([a-z0-9 _\-\.\(\)]+)\s+folder", text)
+        if m:
+            plan.append({"action": "open_item", "name": m.group(1).strip()})
+        m2 = re.search(r"open\s+([a-z0-9 _\-\.\(\)]+)\s+file", text)
+        if m2:
+            plan.append({"action": "open_item", "name": m2.group(1).strip()})
+        list_kind = "all"
+        if "list folders" in text or "what folders" in text:
+            list_kind = "folders"
+        elif "list files" in text or "what files" in text:
+            list_kind = "files"
+        if any(k in text for k in ("tell", "list", "what", "show")):
+            plan.append({"action": "list", "type": list_kind})
+        return {"intent": "desktop_task", "plan": plan, "reply": "Done."}
+
+    if not llm_client:
+        return True, _rule_plan(instr)
+
+    sys = {
+        "role": "system",
+        "content": (
+            "Return only JSON. Plan desktop steps for Windows using these actions:\n"
+            "- open_explorer\n- open_path {path}\n- open_downloads\n- click_text {text}\n- open_item {name}\n- list {type: folders|files|all}\n"
+            "Prefer open_path. Output: {\"intent\":\"desktop_task\",\"plan\":[...],\"reply\":\"...\"}"
+        ),
+    }
+    usr = {"role": "user", "content": instr}
+
+    raw = ""
+    try:
+        try:
+            r = llm_client.chat.completions.create(
+                model=LLM_MODEL,
+                messages=[sys, usr],
+                temperature=0.2,
+                max_tokens=500,
+                response_format={"type": "json_object"},
+            )
+            raw = r.choices[0].message.content or ""
+            j = json.loads(raw)
+        except Exception:
+            r = llm_client.chat.completions.create(
+                model=LLM_MODEL,
+                messages=[sys, usr],
+                temperature=0.2,
+                max_tokens=500,
+            )
+            raw = r.choices[0].message.content or ""
+            j = _coerce_json_from_text(raw)
+
+        if not isinstance(j, dict):
+            return True, _rule_plan(instr)
+        if j.get("intent") != "desktop_task":
+            j["intent"] = "desktop_task"
+        if not isinstance(j.get("plan"), list) or not j["plan"]:
+            return True, _rule_plan(instr)
+        if "reply" not in j or not isinstance(j["reply"], str):
+            j["reply"] = "Done."
+        return True, j
+    except Exception:
+        return True, _rule_plan(instr)
+
+def _execute_desktop_plan(plan_obj):
+    logs = []
+    current_path = None
+    listed = {"folders": [], "files": [], "all": []}
+    if not isinstance(plan_obj, dict):
+        return False, logs, listed, "bad plan"
+    steps = plan_obj.get("plan") or []
+    for step in steps:
+        act = (step.get("action") or "").lower()
+        if act == "open_explorer":
+            ok, msg = _open_explorer_window()
+            logs.append(f"open_explorer: {msg}")
+            if not ok:
+                return False, logs, listed, msg
+            _screenshot()
+        elif act == "open_downloads":
+            p = _downloads_path()
+            ok, msg = _explorer_open_path(p)
+            logs.append(f"open_downloads: {msg}")
+            if not ok:
+                return False, logs, listed, msg
+            current_path = p
+            _screenshot()
+
+        elif act == "open_path":
+            p = _expand_user_env_path(step.get("path") or "")
+            ok, msg = _explorer_open_path(p)
+            logs.append(f"open_path: {msg}")
+            if not ok:
+                return False, logs, listed, msg
+            current_path = p
+            _screenshot()
+        elif act == "click_text":
+            target = step.get("text") or ""
+            pos, score = _find_click_target_by_text(target)
+            if not pos or score < 0.6:
+                return False, logs, listed, f"text not found: {target}"
+            ok, msg = _click_xy(pos[0], pos[1], double=False)
+            logs.append(f"click_text:{target} score={round(score,2)} {msg}")
+            _screenshot()
+        elif act == "open_item":
+            name = step.get("name") or ""
+            pos, score = _find_click_target_by_text(name)
+            if not pos or score < 0.6:
+                return False, logs, listed, f"item not found: {name}"
+            ok, msg = _click_xy(pos[0], pos[1], double=True)
+            logs.append(f"open_item:{name} score={round(score,2)} {msg}")
+            if current_path:
+                current_path = os.path.join(current_path, name)
+            _screenshot()
+        elif act == "list":
+            ltype = (step.get("type") or "all").lower()
+            if not current_path:
+                cp = _get_clipboard_path_from_explorer()
+                if cp:
+                    current_path = cp
+            if not current_path:
+                return False, logs, listed, "unknown current path"
+            ok, items, err = _list_dir(current_path, kind=ltype)
+            logs.append(f"list:{ltype} @ {current_path}")
+            if not ok:
+                return False, logs, listed, err
+            if ltype == "folders":
+                listed["folders"] = items
+            elif ltype == "files":
+                listed["files"] = items
+            else:
+                listed["all"] = items
+        else:
+            logs.append(f"skip:{act}")
+    return True, logs, listed, ""
+
+def _is_desktopish_request(text: str) -> bool:
+    if not text:
+        return False
+    t = text.lower()
+    if any(k in t for k in (
+        "file explorer","explorer","open folder","open file","list files","list folders",
+        "downloads","documents","desktop","pictures","videos","directory","path","navigate to"
+    )):
+        return True
+    if re.search(r"(?i)\b[a-z]:\\", text) or ("\\" in text and ":\\" in text):
+        return True
+    if ("%userprofile%" in t) or ("~" in t and "http" not in t):
+        return True
+    if "screenshot" in t or "click" in t or "double click" in t:
+        return True
+    return False
+
+def _open_url_new_window(url: str):
+    try:
+        exe = BROWSER_PATH
+        if exe and os.path.exists(exe):
+            subprocess.Popen([exe, "--new-window", url], close_fds=True)
+            return True, f"launched:{exe}"
+        for cand in ("msedge.exe", "chrome.exe", "firefox.exe"):
+            path = shutil.which(cand)
+            if path:
+                subprocess.Popen([path, "--new-window", url], close_fds=True)
+                return True, f"launched:{cand}"
+        webbrowser.open_new(url)
+        return True, "launched:default"
+    except Exception as e:
+        return False, f"browser launch failed: {e}"
+
+def _explorer_open_path(path: str, new_window: bool = EXPLORER_NEW_WINDOW):
+    p = _expand_user_env_path(path)
+    if DRY_RUN:
+        return True, f"(DRY_RUN) explorer {p}"
+    try:
+        if new_window:
+            subprocess.Popen(["explorer.exe", "/n,", p], close_fds=True)
+            time.sleep(1.2)
+            return True, f"explorer new-window {p}"
+        else:
+            return _addrbar_go(p)
+    except Exception as e:
+        return False, f"explorer launch failed: {e}"
+
+
 # ---------------- Routes ----------------
 @app.route("/", methods=["GET"])
 def index():
@@ -702,13 +1050,36 @@ def open_route():
         _add_history_entry({"id": f"b-{int(time.time()*1000)}", "sender": "bot", "text": msg, "time": time.time()})
         return render_template_string(HTML, result=msg)
 
+    if intent == "desktop_task":
+        instruction = resp.get("instruction") or prompt
+        ok_plan, plan_or_err = _plan_desktop_instruction(instruction)
+        if not ok_plan:
+            _add_history_entry({"id": f"b-{int(time.time()*1000)}","sender":"bot","text": plan_or_err,"time": time.time()})
+            return render_template_string(HTML, result=plan_or_err)
+        exec_ok, logs, listed, err = _execute_desktop_plan(plan_or_err)
+        if not exec_ok:
+            _add_history_entry({"id": f"b-{int(time.time()*1000)}","sender":"bot","text": err,"time": time.time()})
+            return render_template_string(HTML, result=err)
+        reply = resp.get("reply") or "Done."
+        folders = listed.get("folders")
+        files = listed.get("files")
+        lines = [reply]
+        if folders is not None:
+            lines.append("Folders: " + (", ".join(folders) if folders else "(none)"))
+        if files is not None:
+            lines.append("Files: " + (", ".join(files) if files else "(none)"))
+        if folders is None and files is None:
+            items = listed.get("all") or []
+            lines.append("Items: " + (", ".join(items) if items else "(none)"))
+        text_out = "\n".join(lines)
+        _add_history_entry({"id": f"b-{int(time.time()*1000)}","sender":"bot","text": text_out,"time": time.time()})
+        return render_template_string(HTML, result=text_out)
+
     if intent == "open_app" and app_name:
         success, msg = _open_app_by_name_from_llm(app_name)
         full_reply = f"{reply_text} ({msg})"
         _add_history_entry({"id": f"b-{int(time.time()*1000)}", "sender": "bot", "text": full_reply, "time": time.time()})
         return render_template_string(HTML, result=full_reply)
-
-    # default chat
     _add_history_entry({"id": f"b-{int(time.time()*1000)}", "sender": "bot", "text": reply_text, "time": time.time()})
     return render_template_string(HTML, result=reply_text)
 
@@ -838,6 +1209,21 @@ def open_api():
             app.logger.exception("Summarize via router failed")
             return jsonify({"ok": False, "message": f"Summarize failed: {e}"}), 500
 
+    if intent == "desktop_task":
+        instruction = resp.get("instruction") or prompt
+        ok_plan, plan_or_err = _plan_desktop_instruction(instruction)
+        if not ok_plan:
+            _add_history_entry({"id": f"b-{int(time.time()*1000)}","sender":"bot","text": plan_or_err,"time": time.time()})
+            return jsonify({"ok": False, "error": plan_or_err}), 500
+        exec_ok, logs, listed, err = _execute_desktop_plan(plan_or_err)
+        if not exec_ok:
+            _add_history_entry({"id": f"b-{int(time.time()*1000)}","sender":"bot","text": err,"time": time.time()})
+            return jsonify({"ok": False, "plan": plan_or_err, "logs": logs, "error": err}), 500
+        reply = resp.get("reply") or "Done."
+        _add_history_entry({"id": f"b-{int(time.time()*1000)}","sender":"bot","text": reply,"time": time.time()})
+        return jsonify({"ok": True, "message": reply, "plan": plan_or_err, "logs": logs, "result": listed}), 200
+
+
     if intent == "open_app" and app_name:
         sync = request.args.get("sync") == "1"
         if sync:
@@ -953,7 +1339,6 @@ def api_email_summarize():
         app.logger.exception("Summarize failed")
         return jsonify({"ok": False, "error": f"Summarize failed: {e}"}), 500
 
-# Direct search API (no LLM)
 @app.route("/api/search", methods=["POST", "OPTIONS"])
 def api_search():
     if request.method == "OPTIONS":
@@ -976,6 +1361,31 @@ def api_search():
     _add_history_entry({"id": f"b-{int(time.time()*1000)}","sender":"bot","text": "Here’s what I found:", "time": time.time()})
     _add_history_entry({"id": f"b-{int(time.time()*1000)}","sender":"bot","text": md, "time": time.time()})
     return jsonify({"ok": True, "query": q, "results": results_or_err, "readable": tts, "markdown": md}), 200
+
+@app.route("/api/desktop/run", methods=["POST", "OPTIONS"])
+def api_desktop_run():
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True}), 200
+    ok_req, errmsg = _require_api_key(request)
+    if not ok_req:
+        return jsonify({"ok": False, "error": errmsg}), 401
+    data = request.get_json(force=True, silent=True) or {}
+    instruction = (data.get("instruction") or "").strip()
+    if not instruction:
+        return jsonify({"ok": False, "error": "provide 'instruction'"}), 400
+    _add_history_entry({"id": f"u-{int(time.time()*1000)}", "sender": "user", "text": instruction, "time": time.time()})
+    ok_plan, plan_or_err = _plan_desktop_instruction(instruction)
+    if not ok_plan:
+        _add_history_entry({"id": f"b-{int(time.time()*1000)}", "sender": "bot", "text": plan_or_err, "time": time.time()})
+        return jsonify({"ok": False, "error": plan_or_err}), 500
+    exec_ok, logs, listed, err = _execute_desktop_plan(plan_or_err)
+    reply = plan_or_err.get("reply") or ("Done." if exec_ok else "Failed.")
+    if exec_ok:
+        _add_history_entry({"id": f"b-{int(time.time()*1000)}", "sender": "bot", "text": reply, "time": time.time()})
+        return jsonify({"ok": True, "plan": plan_or_err, "logs": logs, "result": listed, "message": reply}), 200
+    else:
+        _add_history_entry({"id": f"b-{int(time.time()*1000)}", "sender": "bot", "text": err, "time": time.time()})
+        return jsonify({"ok": False, "plan": plan_or_err, "logs": logs, "error": err}), 500
 
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=int(os.environ.get("FLASK_PORT", 5003)), debug=False, threaded=True)

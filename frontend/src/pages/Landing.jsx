@@ -64,7 +64,7 @@ export default function Landing({ apiBase = "http://127.0.0.1:5003", apiKey = nu
   }, []);
 
   useEffect(() => {
-    if (!history || history.length === 0) return;
+    if (!history?.length) return;
     const last = history[history.length - 1];
     const lastId = last?.id ?? String(history.length);
     const isNew = lastIdRef.current !== lastId;
@@ -77,16 +77,33 @@ export default function Landing({ apiBase = "http://127.0.0.1:5003", apiKey = nu
     }
   }, [history, scrollToBottom]);
 
-  const append = (entry) => setHistory((h) => [...h, entry]);
+  const fetchHistory = useCallback(async () => {
+    try {
+      const headers = {};
+      if (apiKey) headers["X-API-Key"] = apiKey;
+      const res = await fetch(`${base}/api/history`, { headers });
+      const data = await res.json();
+      if (Array.isArray(data)) setHistory(data);
+    } catch {}
+  }, [base, apiKey]);
+
+  useEffect(() => {
+    let timer;
+    const start = async () => {
+      await fetchHistory();
+      timer = setInterval(fetchHistory, 1000);
+    };
+    start();
+    return () => timer && clearInterval(timer);
+  }, [fetchHistory]);
 
   async function sendPrompt(textOverride = null) {
     const text = (textOverride || prompt).trim();
     if (!text) return;
 
-    append({ id: `u-${Date.now()}`, sender: "user", text, time: new Date().toISOString() });
-    if (!textOverride) setPrompt("");
     setLoading(true);
     setError(null);
+    if (!textOverride) setPrompt("");
 
     try {
       const headers = { "Content-Type": "application/json" };
@@ -98,18 +115,24 @@ export default function Landing({ apiBase = "http://127.0.0.1:5003", apiKey = nu
         body: JSON.stringify({ prompt: text }),
       });
 
-      const json = await res.json();
-      if (!res.ok) throw new Error(json?.error || json?.message || `HTTP ${res.status}`);
+      await res.json();
+      if (!res.ok) throw new Error("Request failed");
 
-      const reply =
-        json?.markdown || json?.readable || json?.summary || json?.message || (json?.ok ? "OK" : "Failed");
+      await fetchHistory();
 
-      append({ id: `b-${Date.now()}`, sender: "ainek", text: reply, time: new Date().toISOString() });
       autoStickRef.current = true;
       setShowJump(false);
     } catch (e) {
       setError(e?.message || "Request failed");
-      append({ id: `b-err-${Date.now()}`, sender: "ainek", text: `Error: ${e?.message}` });
+      setHistory((h) => [
+        ...h,
+        {
+          id: `b-err-${Date.now()}`,
+          sender: "bot",
+          text: `Error: ${e?.message || "Request failed"}`,
+          time: new Date().toISOString(),
+        },
+      ]);
     } finally {
       setLoading(false);
     }
@@ -127,43 +150,46 @@ export default function Landing({ apiBase = "http://127.0.0.1:5003", apiKey = nu
         </div>
       </div>
 
-      {/* Messages area */}
+      {/* Chat window */}
       <main className="flex-1 w-full max-w-7xl mx-auto px-4">
         <div className="pt-4 space-y-4" style={{ paddingBottom: `${composerHeight + 16}px` }}>
-          {history.map((m) => (
-            <div key={m.id} className={`flex items-start gap-2 ${m.sender === "user" ? "justify-end" : "justify-start"}`}>
-              {m.sender !== "user" && (
-                <Avatar className="h-8 w-8">
-                  <AvatarImage src="/bot-avatar.png" alt="Ainek" />
-                  <AvatarFallback>A</AvatarFallback>
-                </Avatar>
-              )}
-              <Card
-                className={`max-w-[44rem] rounded-2xl shadow-sm ${
-                  m.sender === "user"
-                    ? "bg-primary text-primary-foreground rounded-br-sm"
-                    : "bg-secondary text-secondary-foreground rounded-bl-sm"
-                }`}
-              >
-                <CardContent className="px-4 py-2">
-                  <div className="prose prose-sm md:prose-base prose-invert dark:prose-invert">
-                    <ReactMarkdown>{m.text}</ReactMarkdown>
-                  </div>
-                  {m.time && (
-                    <div className="text-[10px] text-muted-foreground mt-1">
-                      {new Date(m.time).toLocaleTimeString()}
+          {history.map((m) => {
+            const isUser = m.sender === "user";
+            return (
+              <div key={m.id} className={`flex items-start gap-2 ${isUser ? "justify-end" : "justify-start"}`}>
+                {!isUser && (
+                  <Avatar className="h-8 w-8">
+                    <AvatarImage src="/bot-avatar.png" alt="Ainek" />
+                    <AvatarFallback>A</AvatarFallback>
+                  </Avatar>
+                )}
+                <Card
+                  className={`max-w-[44rem] rounded-2xl shadow-sm ${
+                    isUser
+                      ? "bg-primary text-primary-foreground rounded-br-sm"
+                      : "bg-secondary text-secondary-foreground rounded-bl-sm"
+                  }`}
+                >
+                  <CardContent className="px-4 py-2">
+                    <div className="prose prose-sm md:prose-base prose-invert dark:prose-invert">
+                      <ReactMarkdown>{m.text || ""}</ReactMarkdown>
                     </div>
-                  )}
-                </CardContent>
-              </Card>
-              {m.sender === "user" && (
-                <Avatar className="h-8 w-8">
-                  <AvatarImage src="/user-avatar.png" alt="You" />
-                  <AvatarFallback>U</AvatarFallback>
-                </Avatar>
-              )}
-            </div>
-          ))}
+                    {m.time && (
+                      <div className="text-[10px] text-muted-foreground mt-1">
+                        {new Date(m.time).toLocaleTimeString()}
+                      </div>
+                    )}
+                  </CardContent>
+                </Card>
+                {isUser && (
+                  <Avatar className="h-8 w-8">
+                    <AvatarImage src="/user-avatar.png" alt="You" />
+                    <AvatarFallback>U</AvatarFallback>
+                  </Avatar>
+                )}
+              </div>
+            );
+          })}
 
           {loading && (
             <div className="flex items-center gap-2">
@@ -211,7 +237,7 @@ export default function Landing({ apiBase = "http://127.0.0.1:5003", apiKey = nu
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && sendPrompt()}
-              placeholder='Type here, or just speak — Ainek is always listening'
+              placeholder="Type here, or just speak — Ainek is always listening"
             />
             <Button onClick={() => sendPrompt()} disabled={loading}>
               {loading ? "Sending…" : "Send"}
