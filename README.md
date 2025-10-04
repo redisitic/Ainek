@@ -1,5 +1,3 @@
-# ye sabh karna hei aaj
-
 # Alnek: AI-Powered Voice Assistant for Visually Impaired Users  
 
 ---
