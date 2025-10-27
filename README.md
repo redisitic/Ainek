@@ -1,5 +1,6 @@
 # Alnek: AI-Powered Voice Assistant for Visually Impaired Users  
-
+## Demo 
+[https://youtu.be/dQw4w9WgXcQ?si=yPIiY-nPjug4M8I_](https://youtu.be/dQw4w9WgXcQ?si=yPIiY-nPjug4M8I_)
 ---
 
 ## Problem Statement  
