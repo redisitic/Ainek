@@ -1,7 +1,4 @@
 # Alnek: AI-Powered Voice Assistant for Visually Impaired Users  
-## Demo 
-[https://youtu.be/dQw4w9WgXcQ?si=yPIiY-nPjug4M8I_](https://youtu.be/dQw4w9WgXcQ?si=yPIiY-nPjug4M8I_)
----
 
 ## Problem Statement  
 Visually impaired users struggle with modern GUIs where screen readers fail to interpret icons, menus, and visual cues. This creates dependency on external help for tasks like browsing, emailing, or navigating files.  
